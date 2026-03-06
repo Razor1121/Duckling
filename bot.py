@@ -104,6 +104,10 @@ SUSPICIOUS_HOST_TERMS = re.compile(r'(?:phish|malware|virus|danger|suspicious|fa
 SUSPICIOUS_PATH_TERMS = re.compile(r'/(?:login|verify|secure|warning|scan|payload|download|redirect|auth|account|bank|wallet)', re.IGNORECASE)
 SUSPICIOUS_FILE_EXT = re.compile(r'\.(?:exe|scr|bat|cmd|ps1|zip|rar|js)(?:$|\?)', re.IGNORECASE)
 IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.gif')
+RISKY_TLDS = {
+    'bond', 'zip', 'mov', 'click', 'top', 'gq', 'cf', 'ga', 'tk', 'ml', 'work',
+    'quest', 'country', 'xyz', 'rest', 'cam', 'cfd', 'monster'
+}
 
 def _normalize_extracted_text(text: str) -> str:
     if not text:
@@ -246,8 +250,21 @@ def is_phish(url: str) -> bool:
         return False
     if any(host == b or host.endswith('.' + b) for b in blocklist):
         return True
-      
+
     score = 0
+
+    labels = [part for part in host.split('.') if part]
+    second_level = labels[-2] if len(labels) >= 2 else ''
+    tld = labels[-1] if labels else ''
+
+    # Catch throwaway/random-looking domains often used in short-lived phishing campaigns.
+    if tld in RISKY_TLDS:
+        score += 1
+    if second_level and len(second_level) >= 8 and re.search(r'\d', second_level) and re.search(r'[a-z]', second_level):
+        score += 1
+    if second_level and re.search(r'[aeiou]', second_level) is None and len(second_level) >= 7:
+        score += 1
+
     if PHISH_RE.search(url):
         score += 2
     if SUSPICIOUS_HOST_TERMS.search(host):
