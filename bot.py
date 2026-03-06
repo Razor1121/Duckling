@@ -31,6 +31,9 @@ except Exception:  # pragma: no cover - optional dependency
     pyzbar_decode = None
 
 
+OCR_READY = True
+
+
 def _configure_tesseract_path():
     if pytesseract is None:
         return
@@ -45,6 +48,8 @@ def _configure_tesseract_path():
         candidates = [
             r'C:\Program Files\Tesseract-OCR\tesseract.exe',
             r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+            '/usr/bin/tesseract',
+            '/usr/local/bin/tesseract',
         ]
         for candidate in candidates:
             if os.path.exists(candidate):
@@ -225,7 +230,10 @@ def _build_preprocessed_images(image_bytes: bytes):
 
 
 def _ocr_from_images(images):
+    global OCR_READY
     if not images or pytesseract is None or Image is None:
+        return ''
+    if not OCR_READY:
         return ''
 
     chunks = []
@@ -242,6 +250,7 @@ def _ocr_from_images(images):
                 first_error = f'{type(exc).__name__}: {exc}'
             if type(exc).__name__ == 'TesseractNotFoundError':
                 # No point retrying other image passes if tesseract binary is missing.
+                OCR_READY = False
                 break
             continue
         if text and text.strip():
