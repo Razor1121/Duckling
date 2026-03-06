@@ -62,7 +62,7 @@ def _configure_tesseract_path():
     try:
         pytesseract.get_tesseract_version()
     except Exception as exc:
-        log.warning('Tesseract configured but version probe failed: %s', exc)
+        logging.getLogger('AntiPhish').warning('Tesseract configured but version probe failed: %s', exc)
 
 
 _configure_tesseract_path()
@@ -239,7 +239,10 @@ def _ocr_from_images(images):
         except Exception as exc:
             failed_passes += 1
             if first_error is None:
-                first_error = str(exc)
+                first_error = f'{type(exc).__name__}: {exc}'
+            if type(exc).__name__ == 'TesseractNotFoundError':
+                # No point retrying other image passes if tesseract binary is missing.
+                break
             continue
         if text and text.strip():
             chunks.append(text)
