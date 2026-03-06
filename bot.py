@@ -30,6 +30,43 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     pyzbar_decode = None
 
+
+def _configure_tesseract_path():
+    if pytesseract is None:
+        return
+
+    configured = os.getenv('TESSERACT_CMD', '').strip()
+    resolved_cmd = ''
+    if configured and os.path.exists(configured):
+        pytesseract.pytesseract.tesseract_cmd = configured
+        resolved_cmd = configured
+
+    if not resolved_cmd:
+        candidates = [
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                pytesseract.pytesseract.tesseract_cmd = candidate
+                resolved_cmd = candidate
+                break
+
+    if resolved_cmd:
+        tessdata_dir = os.path.join(os.path.dirname(resolved_cmd), 'tessdata')
+        if os.path.isdir(tessdata_dir) and not os.getenv('TESSDATA_PREFIX'):
+            os.environ['TESSDATA_PREFIX'] = tessdata_dir
+    else:
+        return
+
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        log.warning('Tesseract configured but version probe failed: %s', exc)
+
+
+_configure_tesseract_path()
+
 TOKEN = "Paste your bot token here"
 PREFIX = '='
 LOG_CHANNEL_ID = 0
@@ -113,6 +150,10 @@ def _normalize_extracted_text(text: str) -> str:
     if not text:
         return ''
     normalized = text.replace('[.]', '.').replace('(.)', '.').replace('{.}', '.')
+    # OCR often inserts spaces/newlines around separators in URLs.
+    normalized = re.sub(r'\s*([.:/])\s*', r'\1', normalized)
+    normalized = re.sub(r'\b(h\s*t\s*t\s*p\s*s?)\s*:\s*/\s*/', lambda m: m.group(1).replace(' ', '') + '://', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+', ' ', normalized)
     normalized = re.sub(r'hxxps?://', lambda m: 'https://' if m.group(0).lower().startswith('hxxps') else 'http://', normalized, flags=re.IGNORECASE)
     return normalized
 
@@ -189,14 +230,23 @@ def _ocr_from_images(images):
 
     chunks = []
     config = '--oem 3 --psm 6'
+    failed_passes = 0
+    first_error = None
     for img in images:
         try:
             pil_img = Image.fromarray(img)
             text = pytesseract.image_to_string(pil_img, config=config)
-        except Exception:
+        except Exception as exc:
+            failed_passes += 1
+            if first_error is None:
+                first_error = str(exc)
             continue
         if text and text.strip():
             chunks.append(text)
+
+    if failed_passes and not chunks:
+        detail = f' First error: {first_error}' if first_error else ''
+        log.warning('OCR failed on all image passes. Verify Tesseract installation and PATH/TESSERACT_CMD configuration.%s', detail)
 
     return '\n'.join(chunks)
 
