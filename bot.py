@@ -1,14 +1,40 @@
-import os, re, json, logging, random, html, asyncio
+import os, re, io, json, logging, random, html, asyncio
 from urllib import request
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import discord
 from discord.ext import commands
 
-TOKEN = 'PASTE_YOUR_BOT_TOKEN_HERE'
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional dependency
+    cv2 = None
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency
+    np = None
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
+
+try:
+    import pytesseract
+except Exception:  # pragma: no cover - optional dependency
+    pytesseract = None
+
+try:
+    from pyzbar.pyzbar import decode as pyzbar_decode
+except Exception:  # pragma: no cover - optional dependency
+    pyzbar_decode = None
+
+TOKEN = "Paste your bot token here"
 PREFIX = '='
 LOG_CHANNEL_ID = 0
 TICKET_CHANNEL_ID = 0
-QUARANTINE_ROLE_ID = 1441823642294943774
+QUARANTINE_ROLE_ID = 0
 MALICIOUS_LINK_LOG_FILE = 'malicious_links.log'
 
 # Command role access (up to 8 role IDs per command).
@@ -30,6 +56,8 @@ log = logging.getLogger('AntiPhish')
 
 # simple phishing detector
 URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
+DOMAIN_RE = re.compile(r'\b(?:(?:[a-z0-9-]{1,63})\.)+[a-z]{2,63}\b', re.IGNORECASE)
+TEXT_URL_RE = re.compile(r'\b(?:https?://|hxxps?://)?(?:www\.)?(?:(?:[a-z0-9-]{1,63})\.)+[a-z]{2,63}(?:/[\w\-./?%&=+#:@~;,]*)?', re.IGNORECASE)
 TOKEN_RE = re.compile(r'\b[MNO]?[A-Za-z0-9_-]{22,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}\b')
 PHISH_PATTERNS = [
     r'(?:discord\.gg|discord(?:app)?\.com).*?(?:verify|confirm|nitro|login)',
@@ -57,12 +85,148 @@ BLOCKLIST = (
     'steamcornnunity.com',
     'stearncommunity.com',
 )
+KNOWN_PHISHING_DOMAINS = (
+    'discord-app.com',
+    'discordnitro.com',
+    'dlscord.gift',
+    'steamcornmunity.com',
+    'steamcomrnunity.com',
+    'stearncommunity.com',
+    'faceboook-login.com',
+    'paypa1.com',
+    'micr0soft-login.com',
+    'googledrive-sharing.com',
+    'dropbox-shared-files.com',
+) + BLOCKLIST
 whitelist = WHITELIST
 blocklist = BLOCKLIST
 SUSPICIOUS_HOST_TERMS = re.compile(r'(?:phish|malware|virus|danger|suspicious|fake|secure|bank|alert|portal|redirect)', re.IGNORECASE)
 SUSPICIOUS_PATH_TERMS = re.compile(r'/(?:login|verify|secure|warning|scan|payload|download|redirect|auth|account|bank|wallet)', re.IGNORECASE)
 SUSPICIOUS_FILE_EXT = re.compile(r'\.(?:exe|scr|bat|cmd|ps1|zip|rar|js)(?:$|\?)', re.IGNORECASE)
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.gif')
 
+def _normalize_extracted_text(text: str) -> str:
+    if not text:
+        return ''
+    normalized = text.replace('[.]', '.').replace('(.)', '.').replace('{.}', '.')
+    normalized = re.sub(r'hxxps?://', lambda m: 'https://' if m.group(0).lower().startswith('hxxps') else 'http://', normalized, flags=re.IGNORECASE)
+    return normalized
+
+
+def _normalize_url_candidate(candidate: str) -> str:
+    value = _normalize_extracted_text(candidate.strip().strip('`<>[](){}\'\"'))
+    if not value:
+        return ''
+    if not re.match(r'^https?://', value, re.IGNORECASE):
+        value = f'http://{value}'
+    return value
+
+
+def _extract_urls_for_analysis(text: str):
+    normalized = _normalize_extracted_text(text or '')
+    urls = set()
+    for match in TEXT_URL_RE.findall(normalized):
+        candidate = _normalize_url_candidate(match)
+        if candidate:
+            urls.add(candidate)
+    for match in URL_RE.findall(normalized):
+        candidate = _normalize_url_candidate(match)
+        if candidate:
+            urls.add(candidate)
+    return sorted(urls)
+
+
+def _find_known_phishing_domains(text: str):
+    normalized = _normalize_extracted_text(text or '').lower()
+    if not normalized:
+        return []
+
+    found = set()
+    # Match direct known domains first.
+    for domain in KNOWN_PHISHING_DOMAINS:
+        d = domain.lower()
+        if re.search(rf'(^|[^a-z0-9.-]){re.escape(d)}([^a-z0-9.-]|$)', normalized):
+            found.add(d)
+
+    # Match extracted domains against blocklist-style matching.
+    for token in DOMAIN_RE.findall(normalized):
+        host = token.lower().strip('.')
+        if any(host == bad or host.endswith('.' + bad) for bad in KNOWN_PHISHING_DOMAINS):
+            found.add(host)
+
+    return sorted(found)
+
+
+def _build_preprocessed_images(image_bytes: bytes):
+    if cv2 is None or np is None:
+        return []
+
+    raw = np.frombuffer(image_bytes, np.uint8)
+    image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    if image is None:
+        return []
+
+    # Multi-branch preprocessing improves OCR quality across noisy screenshots.
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(denoised)
+    _, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    enlarged = cv2.resize(clahe, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(enlarged, -1, sharpen_kernel)
+
+    return [gray, clahe, otsu, adaptive, sharpened]
+
+
+def _ocr_from_images(images):
+    if not images or pytesseract is None or Image is None:
+        return ''
+
+    chunks = []
+    config = '--oem 3 --psm 6'
+    for img in images:
+        try:
+            pil_img = Image.fromarray(img)
+            text = pytesseract.image_to_string(pil_img, config=config)
+        except Exception:
+            continue
+        if text and text.strip():
+            chunks.append(text)
+
+    return '\n'.join(chunks)
+
+
+def _decode_qr_payloads(images):
+    payloads = set()
+
+    if cv2 is not None:
+        detector = cv2.QRCodeDetector()
+        for img in images:
+            try:
+                ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
+                if ok and decoded_info:
+                    for item in decoded_info:
+                        if item:
+                            payloads.add(item.strip())
+                else:
+                    single, _, _ = detector.detectAndDecode(img)
+                    if single:
+                        payloads.add(single.strip())
+            except Exception:
+                continue
+
+    if pyzbar_decode is not None:
+        for img in images:
+            try:
+                for obj in pyzbar_decode(img):
+                    data = obj.data.decode('utf-8', errors='ignore').strip()
+                    if data:
+                        payloads.add(data)
+            except Exception:
+                continue
+
+    return sorted(payloads)
 
 def is_phish(url: str) -> bool:
     try:
@@ -80,9 +244,9 @@ def is_phish(url: str) -> bool:
     host = host.lower()
     if any(host == w or host.endswith('.' + w) for w in WHITELIST):
         return False
-    if any(host == b or host.endswith('.' + b) for b in BLOCKLIST):
+    if any(host == b or host.endswith('.' + b) for b in blocklist):
         return True
-
+      
     score = 0
     if PHISH_RE.search(url):
         score += 2
@@ -135,13 +299,13 @@ class Bot(commands.Bot):
 
         async def cases_callback(ctx, member: discord.Member = None):
             await self.cases(ctx, member)
-
+          
         async def reply_callback(ctx, user_id: int, *, text: str):
             await self.reply(ctx, user_id, text=text)
 
         async def lastphish_callback(ctx):
             await self.lastphish(ctx)
-
+          
         async def trivia_callback(ctx):
             await self.trivia(ctx)
 
@@ -156,7 +320,7 @@ class Bot(commands.Bot):
 
         async def rps_callback(ctx, choice: str):
             await self.rps(ctx, choice=choice)
-
+          
         check_cmd = commands.Command(check_callback, name='check')
         check_cmd.add_check(commands.is_owner().predicate)
 
@@ -181,14 +345,14 @@ class Bot(commands.Bot):
         reply_cmd = commands.Command(reply_callback, name='reply')
         reply_cmd.add_check(self._make_command_access_check('reply'))
 
-        lastphish_cmd = commands.Command(lastphish_callback, name='lastphish')
-        lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
-
         trivia_cmd = commands.Command(trivia_callback, name='trivia')
         eightball_cmd = commands.Command(eightball_callback, name='8ball')
         coinflip_cmd = commands.Command(coinflip_callback, name='coinflip')
         roll_cmd = commands.Command(roll_callback, name='roll')
         rps_cmd = commands.Command(rps_callback, name='rps')
+
+        lastphish_cmd = commands.Command(lastphish_callback, name='lastphish')
+        lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
 
         for command in [
             check_cmd, help_cmd, ping_cmd, ban_cmd, kick_cmd, timeout_cmd,
@@ -210,7 +374,7 @@ class Bot(commands.Bot):
         except Exception:
             log.exception('Failed to fetch trivia questions')
             return []
-
+ 
     def _get_configured_role_ids(self, command_name: str):
         configured = COMMAND_ROLE_ACCESS.get(command_name, [])
         cleaned = []
@@ -262,8 +426,8 @@ class Bot(commands.Bot):
     def _make_command_access_check(self, command_name: str):
         async def predicate(ctx):
             return await self._has_command_access(ctx, command_name)
-        return predicate
-
+        return predicate 
+      
     def _load_cases(self):
         if os.path.exists('cases.json'):
             try:
@@ -275,7 +439,7 @@ class Bot(commands.Bot):
     def _save_cases(self):
         with open('cases.json','w') as f:
             json.dump(self.case_records, f, indent=2)
-
+          
     def _load_trivia_scores(self):
         if os.path.exists('trivia_scores.json'):
             try:
@@ -331,6 +495,70 @@ class Bot(commands.Bot):
         self.trivia_scores[uid] = entry
         self._save_trivia_scores()
 
+    async def _scan_image_attachments_for_phishing(self, attachments):
+        findings = {
+            'bad_urls': [],
+            'known_domains': [],
+            'qr_payloads': [],
+            'ocr_text_preview': '',
+        }
+
+        if not attachments:
+            return findings
+
+        if cv2 is None or np is None or pytesseract is None or Image is None:
+            log.warning('OCR dependencies missing. Install opencv-python, numpy, pillow, pytesseract, pyzbar')
+            return findings
+
+        aggregated_text = []
+        bad_urls = set()
+        known_domains = set()
+        qr_payloads = set()
+
+        for attachment in attachments:
+            content_type = (attachment.content_type or '').lower()
+            filename = (attachment.filename or '').lower()
+            if not (content_type.startswith('image/') or filename.endswith(IMAGE_EXTENSIONS)):
+                continue
+
+            if attachment.size > 8 * 1024 * 1024:
+                # Skip very large files to avoid blocking event processing.
+                continue
+
+            try:
+                image_bytes = await attachment.read()
+            except Exception:
+                continue
+
+            preprocessed = _build_preprocessed_images(image_bytes)
+            if not preprocessed:
+                continue
+
+            ocr_text = _ocr_from_images(preprocessed)
+            if ocr_text:
+                aggregated_text.append(ocr_text)
+
+            for payload in _decode_qr_payloads(preprocessed):
+                qr_payloads.add(payload)
+                for url in _extract_urls_for_analysis(payload):
+                    if is_phish(url):
+                        bad_urls.add(url)
+                for domain in _find_known_phishing_domains(payload):
+                    known_domains.add(domain)
+
+        full_ocr_text = '\n'.join(aggregated_text)
+        for url in _extract_urls_for_analysis(full_ocr_text):
+            if is_phish(url):
+                bad_urls.add(url)
+        for domain in _find_known_phishing_domains(full_ocr_text):
+            known_domains.add(domain)
+
+        findings['bad_urls'] = sorted(bad_urls)
+        findings['known_domains'] = sorted(known_domains)
+        findings['qr_payloads'] = sorted(qr_payloads)
+        findings['ocr_text_preview'] = _normalize_extracted_text(full_ocr_text)[:1000]
+        return findings
+
     def _format_trivia_leaderboard(self, limit: int = 5):
         rows = []
         for uid, data in self.trivia_scores.items():
@@ -351,14 +579,14 @@ class Bot(commands.Bot):
         for i, (correct, accuracy, answered, name) in enumerate(top, start=1):
             lines.append(f'{i}. {name} — {correct} correct / {answered} answered ({accuracy}%)')
         return '\n'.join(lines)
-
+      
     def _add_case(self, typ, user, mod, reason, extra=None):
         case={'id':len(self.case_records)+1,'type':typ,'user':str(user),'mod':str(mod),'reason':reason,'time':datetime.utcnow().isoformat()}
         if extra: case.update(extra)
         self.case_records.append(case)
         self._save_cases()
         return case
-
+    
     async def _quarantine_user(self, message, trigger: str, evidence: str = ''):
         if not message.guild or not isinstance(message.author, discord.Member):
             return False
@@ -400,7 +628,7 @@ class Bot(commands.Bot):
             pass
 
         return True
-
+    
     async def _handle_dm_ticket(self, message: discord.Message):
         if TICKET_CHANNEL_ID == 0:
             try:
@@ -454,8 +682,8 @@ class Bot(commands.Bot):
             role_ids = self._get_configured_role_ids(cmd)
             if len(COMMAND_ROLE_ACCESS.get(cmd, [])) > MAX_ROLES_PER_COMMAND:
                 log.warning('Only first %s role IDs are used for command "%s"', MAX_ROLES_PER_COMMAND, cmd)
-            log.info('Access config for %s: roles=%s + fallback_perm=True', cmd, role_ids if role_ids else '[]')
-        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='for phishing'))
+            log.info('Access config for %s: roles=%s + fallback_perm=True', cmd, role_ids if role_ids else '[]') 
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name='Gone Phishin'))
 
     async def on_message(self, message):
         if message.author.bot: return
@@ -499,17 +727,37 @@ class Bot(commands.Bot):
 
             return await self.process_commands(message)
 
-        urls = URL_RE.findall(message.content)
+        urls = _extract_urls_for_analysis(message.content)
         bad = [u for u in urls if is_phish(u)]
-        if bad:
-            self._log_malicious_links(message, bad)
+        ocr_findings = await self._scan_image_attachments_for_phishing(message.attachments)
+        merged_bad_urls = sorted(set(bad + ocr_findings.get('bad_urls', [])))
+        known_domains = ocr_findings.get('known_domains', [])
+        qr_payloads = ocr_findings.get('qr_payloads', [])
+
+        if merged_bad_urls or known_domains:
+            self._log_malicious_links(message, merged_bad_urls or known_domains)
             try: await message.delete()
             except: pass
-            await self._quarantine_user(message, 'Malicious link detected', '\n'.join(bad))
-            try:
-                await message.channel.send(f'⚠️ Phishing removed: {" ".join(bad)}', delete_after=10)
-            except: pass
+            evidence_parts = []
+            if merged_bad_urls:
+                evidence_parts.append('URLs:\n' + '\n'.join(merged_bad_urls[:10]))
+            if known_domains:
+                evidence_parts.append('Known phishing domains:\n' + '\n'.join(known_domains[:10]))
+            if qr_payloads:
+                evidence_parts.append('QR payloads:\n' + '\n'.join(qr_payloads[:5]))
+            if ocr_findings.get('ocr_text_preview'):
+                evidence_parts.append('OCR text preview:\n' + ocr_findings['ocr_text_preview'])
 
+            await self._quarantine_user(message, 'Malicious link/domain detected (text or image OCR)', '\n\n'.join(evidence_parts)[:1500])
+            try:
+                removal_summary = merged_bad_urls if merged_bad_urls else known_domains
+                await message.channel.send(
+                    f'⚠️ Phishing removed: {" ".join(removal_summary[:5])}',
+                    delete_after=10,
+                )
+            except Exception:
+                pass
+              
             log_channel = None
             if LOG_CHANNEL_ID:
                 log_channel = self.get_channel(LOG_CHANNEL_ID)
@@ -522,8 +770,15 @@ class Bot(commands.Bot):
                 timestamp=datetime.utcnow()
             )
             embed.add_field(name='User', value=f'{message.author} ({message.author.id})', inline=False)
-            embed.add_field(name='Link(s)', value='\n'.join(bad), inline=False)
+            if merged_bad_urls:
+                embed.add_field(name='Detected URL(s)', value='\n'.join(merged_bad_urls)[:1000], inline=False)
+            if known_domains:
+                embed.add_field(name='Known phishing domains', value='\n'.join(known_domains)[:1000], inline=False)
+            if qr_payloads:
+                embed.add_field(name='Decoded QR payload(s)', value='\n'.join(qr_payloads)[:1000], inline=False)
             embed.add_field(name='Channel', value=message.channel.mention, inline=False)
+            if ocr_findings.get('ocr_text_preview'):
+                embed.add_field(name='OCR text preview', value=ocr_findings['ocr_text_preview'], inline=False)
 
             try:
                 await log_channel.send(embed=embed)
@@ -559,11 +814,11 @@ class Bot(commands.Bot):
         if isinstance(error, commands.BadArgument):
             await ctx.send('⚠️ Invalid argument provided.')
             return
-
+          
         if isinstance(error, commands.CheckFailure):
             await ctx.send('⛔ You are not allowed to use this command.')
             return
-
+          
         log.exception('Unhandled command error', exc_info=error)
         await ctx.send('⚠️ An unexpected error occurred while running that command.')
 
@@ -601,13 +856,13 @@ class Bot(commands.Bot):
         embed.add_field(name=f'{PREFIX}delete [amount]', value='Delete 1-100 messages.', inline=False)
         embed.add_field(name=f'{PREFIX}reply <user_id> <message>', value='Reply to a user who opened a DM ticket.', inline=False)
         embed.add_field(name=f'{PREFIX}cases [member]', value='Show stored moderation cases.', inline=False)
-        embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
         embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
+        embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
         await ctx.send(embed=embed)
 
     async def cmdhelp(self, ctx):
         await self.cmd_help(ctx)
-
+      
     async def ping(self, ctx):
         await ctx.send('🏓 Pong!')
 
@@ -706,7 +961,7 @@ class Bot(commands.Bot):
         embed.add_field(name='Link(s)', value=links_text[:1000], inline=False)
         embed.add_field(name='Message', value=str(entry.get('content', '(no content)'))[:1000], inline=False)
         await ctx.send(embed=embed)
-
+    
     async def trivia(self, ctx):
         questions = await self._fetch_trivia_questions(10)
         if not questions:
@@ -806,7 +1061,7 @@ class Bot(commands.Bot):
             result = 'I win!'
 
         await ctx.send(f'✊✋✌️ You: **{user_choice}** | Me: **{bot_choice}** — {result}')
-
+  
     @staticmethod
     def _parse_duration(s):
         s=s.lower().strip()
@@ -829,3 +1084,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+

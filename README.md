@@ -70,3 +70,23 @@ The goal of this bot is to create a safer Discord environment by combining autom
 ## Disclaimer
 
 The code is not bulletproof, however it does have a decent list of regexes and other random websites that it will catch.
+
+## Advanced OCR and QR Phishing Detection
+
+The bot now scans image attachments with an OCR + QR pipeline:
+
+- Image preprocessing: denoise, contrast enhancement (CLAHE), thresholding, resize, and sharpening.
+- OCR extraction: multi-pass text extraction using Tesseract.
+- QR detection: OpenCV QR detector with `pyzbar` fallback decoding.
+- URL extraction: detects direct and obfuscated links like `hxxps://` and `example[.]com`.
+- Domain intelligence: checks extracted domains against known phishing-domain patterns.
+
+If a malicious URL/domain is found in message text, OCR text, or decoded QR payloads, the bot removes the message and applies quarantine according to your existing moderation settings.
+
+## Setup Notes
+
+1. Install Python dependencies from `requirements.txt`.
+2. Install Tesseract OCR on the host machine (required by `pytesseract`):
+	- Windows: install Tesseract and ensure `tesseract.exe` is available in `PATH`.
+
+Without Tesseract and the OCR dependencies, image scanning is skipped and only text-link scanning remains active.
