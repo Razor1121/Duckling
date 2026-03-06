@@ -415,7 +415,7 @@ class Bot(commands.Bot):
         timeout_cmd = commands.Command(timeout_callback, name='timeout')
         timeout_cmd.add_check(self._make_command_access_check('timeout'))
 
-        delete_cmd = commands.Command(delete_callback, name='delete')
+        delete_cmd = commands.Command(delete_callback, name='delete', aliases=['clear'])
         delete_cmd.add_check(self._make_command_access_check('delete'))
 
         cases_cmd = commands.Command(cases_callback, name='cases')
@@ -932,7 +932,7 @@ class Bot(commands.Bot):
         embed.add_field(name=f'{PREFIX}ban <member> [reason]', value='Ban a member.', inline=False)
         embed.add_field(name=f'{PREFIX}kick <member> [reason]', value='Kick a member.', inline=False)
         embed.add_field(name=f'{PREFIX}timeout <member> <duration> [reason]', value='Timeout format: 1d / 2h / 30m / 60s.', inline=False)
-        embed.add_field(name=f'{PREFIX}delete [amount]', value='Delete 1-100 messages.', inline=False)
+        embed.add_field(name=f'{PREFIX}clear [amount]', value='Delete 1-100 messages. Alias: delete.', inline=False)
         embed.add_field(name=f'{PREFIX}reply <user_id> <message>', value='Reply to a user who opened a DM ticket.', inline=False)
         embed.add_field(name=f'{PREFIX}cases [member]', value='Show stored moderation cases.', inline=False)
         embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
