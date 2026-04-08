@@ -1,83 +1,18 @@
-import os, re, io, json, logging, random, html, asyncio
+import os, re, json, logging, random, html, asyncio
 from urllib import request
-from urllib.parse import urlparse
 from datetime import datetime, timedelta
 import discord
 from discord.ext import commands
-
-try:
-    import cv2
-except Exception:  # pragma: no cover - optional dependency
-    cv2 = None
-
-try:
-    import numpy as np
-except Exception:  # pragma: no cover - optional dependency
-    np = None
-
-try:
-    from PIL import Image
-except Exception:  # pragma: no cover - optional dependency
-    Image = None
-
-try:
-    import pytesseract
-except Exception:  # pragma: no cover - optional dependency
-    pytesseract = None
-
-try:
-    from pyzbar.pyzbar import decode as pyzbar_decode
-except Exception:  # pragma: no cover - optional dependency
-    pyzbar_decode = None
-
-
-OCR_READY = True
-
-
-def _configure_tesseract_path():
-    if pytesseract is None:
-        return
-
-    configured = os.getenv('TESSERACT_CMD', '').strip()
-    resolved_cmd = ''
-    if configured and os.path.exists(configured):
-        pytesseract.pytesseract.tesseract_cmd = configured
-        resolved_cmd = configured
-
-    if not resolved_cmd:
-        candidates = [
-            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
-            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
-            '/usr/bin/tesseract',
-            '/usr/local/bin/tesseract',
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                pytesseract.pytesseract.tesseract_cmd = candidate
-                resolved_cmd = candidate
-                break
-
-    if resolved_cmd:
-        tessdata_dir = os.path.join(os.path.dirname(resolved_cmd), 'tessdata')
-        if os.path.isdir(tessdata_dir) and not os.getenv('TESSDATA_PREFIX'):
-            os.environ['TESSDATA_PREFIX'] = tessdata_dir
-    else:
-        return
-
-    try:
-        pytesseract.get_tesseract_version()
-    except Exception as exc:
-        logging.getLogger('AntiPhish').warning('Tesseract configured but version probe failed: %s', exc)
-
-
-_configure_tesseract_path()
 
 TOKEN = "Paste your bot token here"
 PREFIX = '='
 LOG_CHANNEL_ID = 0
 TICKET_CHANNEL_ID = 0
+TICKET_STAFF_ROLE_ID = 1443345576832925888
 QUARANTINE_ROLE_ID = 0
 MALICIOUS_LINK_LOG_FILE = 'malicious_links.log'
+CUSTOM_LINK_PATTERNS_FILE = 'custom_link_patterns.json'
+CUSTOM_PHISH_RE = None
 
 # Command role access (up to 8 role IDs per command).
 # Add role IDs to allow those roles to use the command through the bot.
@@ -90,6 +25,7 @@ COMMAND_ROLE_ACCESS = {
     'reply': [],
     'cases': [],
     'lastphish': [],
+    'ticketpanel': [],
 }
 MAX_ROLES_PER_COMMAND = 8
 
@@ -98,7 +34,6 @@ log = logging.getLogger('AntiPhish')
 
 # simple phishing detector
 URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
-DOMAIN_RE = re.compile(r'\b(?:(?:[a-z0-9-]{1,63})\.)+[a-z]{2,63}\b', re.IGNORECASE)
 TEXT_URL_RE = re.compile(r'\b(?:https?://|hxxps?://)?(?:www\.)?(?:(?:[a-z0-9-]{1,63})\.)+[a-z]{2,63}(?:/[\w\-./?%&=+#:@~;,]*)?', re.IGNORECASE)
 TOKEN_RE = re.compile(r'\b[MNO]?[A-Za-z0-9_-]{22,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,}\b')
 PHISH_PATTERNS = [
@@ -145,7 +80,6 @@ blocklist = BLOCKLIST
 SUSPICIOUS_HOST_TERMS = re.compile(r'(?:phish|malware|virus|danger|suspicious|fake|secure|bank|alert|portal|redirect)', re.IGNORECASE)
 SUSPICIOUS_PATH_TERMS = re.compile(r'/(?:login|verify|secure|warning|scan|payload|download|redirect|auth|account|bank|wallet)', re.IGNORECASE)
 SUSPICIOUS_FILE_EXT = re.compile(r'\.(?:exe|scr|bat|cmd|ps1|zip|rar|js)(?:$|\?)', re.IGNORECASE)
-IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.gif')
 RISKY_TLDS = {
     'bond', 'zip', 'mov', 'click', 'top', 'gq', 'cf', 'ga', 'tk', 'ml', 'work',
     'quest', 'country', 'xyz', 'rest', 'cam', 'cfd', 'monster'
@@ -155,7 +89,7 @@ def _normalize_extracted_text(text: str) -> str:
     if not text:
         return ''
     normalized = text.replace('[.]', '.').replace('(.)', '.').replace('{.}', '.')
-    # OCR often inserts spaces/newlines around separators in URLs.
+    # Normalize spaced separators so obfuscated links in text are still parsed.
     normalized = re.sub(r'\s*([.:/])\s*', r'\1', normalized)
     normalized = re.sub(r'\b(h\s*t\s*t\s*p\s*s?)\s*:\s*/\s*/', lambda m: m.group(1).replace(' ', '') + '://', normalized, flags=re.IGNORECASE)
     normalized = re.sub(r'\s+', ' ', normalized)
@@ -186,115 +120,38 @@ def _extract_urls_for_analysis(text: str):
     return sorted(urls)
 
 
-def _find_known_phishing_domains(text: str):
-    normalized = _normalize_extracted_text(text or '').lower()
-    if not normalized:
-        return []
+def _build_phish_pattern_from_link(raw_link: str):
+    normalized_link = _normalize_url_candidate(raw_link or '')
+    if not normalized_link:
+        return '', ''
 
-    found = set()
-    # Match direct known domains first.
-    for domain in KNOWN_PHISHING_DOMAINS:
-        d = domain.lower()
-        if re.search(rf'(^|[^a-z0-9.-]){re.escape(d)}([^a-z0-9.-]|$)', normalized):
-            found.add(d)
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(normalized_link)
+    except Exception:
+        return '', ''
 
-    # Match extracted domains against blocklist-style matching.
-    for token in DOMAIN_RE.findall(normalized):
-        host = token.lower().strip('.')
-        if any(host == bad or host.endswith('.' + bad) for bad in KNOWN_PHISHING_DOMAINS):
-            found.add(host)
+    host = (parsed.hostname or '').lower().strip('.')
+    if not host:
+        return '', ''
 
-    return sorted(found)
+    # Match either a full URL or plain-domain mention of the submitted link.
+    path = (parsed.path or '').strip('/')
+    host_pattern = re.escape(host)
+    if path:
+        path_pattern = re.escape(path)
+        pattern = rf'(?:https?://|hxxps?://)?(?:www\.)?{host_pattern}/{path_pattern}(?:[/?#]\S*)?'
+    else:
+        pattern = rf'(?:https?://|hxxps?://)?(?:www\.)?{host_pattern}(?:[/?#]\S*)?'
 
+    return normalized_link, pattern
 
-def _build_preprocessed_images(image_bytes: bytes):
-    if cv2 is None or np is None:
-        return []
-
-    raw = np.frombuffer(image_bytes, np.uint8)
-    image = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-    if image is None:
-        return []
-
-    # Multi-branch preprocessing improves OCR quality across noisy screenshots.
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    denoised = cv2.fastNlMeansDenoising(gray, None, 15, 7, 21)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(denoised)
-    _, otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    adaptive = cv2.adaptiveThreshold(clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
-    enlarged = cv2.resize(clahe, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharpened = cv2.filter2D(enlarged, -1, sharpen_kernel)
-
-    return [gray, clahe, otsu, adaptive, sharpened]
-
-
-def _ocr_from_images(images):
-    global OCR_READY
-    if not images or pytesseract is None or Image is None:
-        return ''
-    if not OCR_READY:
-        return ''
-
-    chunks = []
-    config = '--oem 3 --psm 6'
-    failed_passes = 0
-    first_error = None
-    for img in images:
-        try:
-            pil_img = Image.fromarray(img)
-            text = pytesseract.image_to_string(pil_img, config=config)
-        except Exception as exc:
-            failed_passes += 1
-            if first_error is None:
-                first_error = f'{type(exc).__name__}: {exc}'
-            if type(exc).__name__ == 'TesseractNotFoundError':
-                # No point retrying other image passes if tesseract binary is missing.
-                OCR_READY = False
-                break
-            continue
-        if text and text.strip():
-            chunks.append(text)
-
-    if failed_passes and not chunks:
-        detail = f' First error: {first_error}' if first_error else ''
-        log.warning('OCR failed on all image passes. Verify Tesseract installation and PATH/TESSERACT_CMD configuration.%s', detail)
-
-    return '\n'.join(chunks)
-
-
-def _decode_qr_payloads(images):
-    payloads = set()
-
-    if cv2 is not None:
-        detector = cv2.QRCodeDetector()
-        for img in images:
-            try:
-                ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
-                if ok and decoded_info:
-                    for item in decoded_info:
-                        if item:
-                            payloads.add(item.strip())
-                else:
-                    single, _, _ = detector.detectAndDecode(img)
-                    if single:
-                        payloads.add(single.strip())
-            except Exception:
-                continue
-
-    if pyzbar_decode is not None:
-        for img in images:
-            try:
-                for obj in pyzbar_decode(img):
-                    data = obj.data.decode('utf-8', errors='ignore').strip()
-                    if data:
-                        payloads.add(data)
-            except Exception:
-                continue
-
-    return sorted(payloads)
 
 def is_phish(url: str) -> bool:
+    normalized_url = _normalize_extracted_text(url or '')
+    if CUSTOM_PHISH_RE is not None and CUSTOM_PHISH_RE.search(normalized_url):
+        return True
+
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -345,14 +202,158 @@ def detect_discord_token(text: str):
     return TOKEN_RE.search(text)
 
 
+class TicketOpenView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label='Open Ticket', style=discord.ButtonStyle.success, custom_id='ticket_open_button')
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message('⚠️ This button can only be used in a server.', ephemeral=True)
+
+        if TICKET_STAFF_ROLE_ID <= 0:
+            return await interaction.response.send_message('⚠️ Staff role is not configured.', ephemeral=True)
+
+        has_staff_role = any(role.id == TICKET_STAFF_ROLE_ID for role in interaction.user.roles)
+        if not has_staff_role and not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message('⛔ Only ticket staff can open this ticket.', ephemeral=True)
+
+        topic = interaction.channel.topic if isinstance(interaction.channel, discord.TextChannel) else ''
+        owner_id = None
+        if topic and 'ticket_owner:' in topic:
+            try:
+                owner_id = int(topic.split('ticket_owner:', 1)[1].split()[0].strip())
+            except Exception:
+                owner_id = None
+
+        if not owner_id:
+            return await interaction.response.send_message('⚠️ Ticket owner could not be identified from this channel.', ephemeral=True)
+
+        member = interaction.guild.get_member(owner_id)
+        if member is None:
+            return await interaction.response.send_message('⚠️ Ticket owner is no longer in this server.', ephemeral=True)
+
+        try:
+            await interaction.channel.set_permissions(member, send_messages=True, reason=f'Ticket opened by {interaction.user}')
+        except Exception:
+            log.exception('Failed to open ticket channel')
+            return await interaction.response.send_message('⚠️ Failed to open the ticket channel.', ephemeral=True)
+
+        opened_embed = discord.Embed(
+            title='✅ Ticket Opened',
+            description=f'{member.mention}, your ticket is now open. You can send messages in this channel.',
+            color=discord.Color.green(),
+            timestamp=datetime.utcnow()
+        )
+        opened_embed.set_footer(text=f'Opened by {interaction.user}')
+        await interaction.response.send_message(embed=opened_embed)
+
+    @discord.ui.button(label='Close Ticket', style=discord.ButtonStyle.danger, custom_id='ticket_close_button')
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message('⚠️ This button can only be used in a server.', ephemeral=True)
+
+        if TICKET_STAFF_ROLE_ID <= 0:
+            return await interaction.response.send_message('⚠️ Staff role is not configured.', ephemeral=True)
+
+        has_staff_role = any(role.id == TICKET_STAFF_ROLE_ID for role in interaction.user.roles)
+        if not has_staff_role and not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message('⛔ Only ticket staff can close this ticket.', ephemeral=True)
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message('⚠️ This is not a text channel ticket.', ephemeral=True)
+
+        topic = interaction.channel.topic or ''
+        owner_id = None
+        if topic and 'ticket_owner:' in topic:
+            try:
+                owner_id = int(topic.split('ticket_owner:', 1)[1].split()[0].strip())
+            except Exception:
+                owner_id = None
+
+        if owner_id:
+            owner = interaction.guild.get_member(owner_id)
+            owner_text = str(owner) if owner else str(owner_id)
+            self.bot._add_case('ticket_closed', owner_text, interaction.user, f'Closed ticket channel {interaction.channel.name}', {'channel_id': interaction.channel.id})
+
+        await interaction.response.send_message('🗂️ Closing this ticket in 3 seconds...', ephemeral=True)
+        await asyncio.sleep(3)
+        try:
+            await interaction.channel.delete(reason=f'Ticket closed by {interaction.user}')
+        except Exception:
+            log.exception('Failed to delete ticket channel')
+
+
+class TicketCreateModal(discord.ui.Modal, title='Create Support Ticket'):
+    ticket_title = discord.ui.TextInput(
+        label='Ticket Title',
+        placeholder='Short summary of your issue',
+        min_length=3,
+        max_length=100,
+        required=True,
+    )
+    ticket_description = discord.ui.TextInput(
+        label='Ticket Description',
+        placeholder='Explain your issue in detail',
+        style=discord.TextStyle.paragraph,
+        min_length=10,
+        max_length=1000,
+        required=True,
+    )
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.bot._create_locked_ticket_from_modal(
+            interaction,
+            str(self.ticket_title).strip(),
+            str(self.ticket_description).strip(),
+        )
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(label='Create Ticket', style=discord.ButtonStyle.primary, custom_id='ticket_create_button')
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message('⚠️ Tickets can only be created inside a server.', ephemeral=True)
+
+        for channel in interaction.guild.text_channels:
+            if channel.topic and f'ticket_owner:{interaction.user.id}' in channel.topic:
+                return await interaction.response.send_message(
+                    f'ℹ️ You already have an open ticket: {channel.mention}',
+                    ephemeral=True
+                )
+
+        await interaction.response.send_modal(TicketCreateModal(self.bot))
+
+
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=PREFIX, intents=discord.Intents.all(), help_command=None)
         self.case_records = []
         self.trivia_scores = {}
+        self.custom_link_patterns = []
+        self.ticket_panel_view = None
+        self.ticket_open_view = None
         self._load_cases()
         self._load_trivia_scores()
+        self._load_custom_link_patterns()
+        self._refresh_custom_phish_regex()
         self._register_commands()
+
+    async def setup_hook(self):
+        # Views must be created after the event loop is running.
+        self.ticket_panel_view = TicketPanelView(self)
+        self.ticket_open_view = TicketOpenView(self)
+        self.add_view(self.ticket_panel_view)
+        self.add_view(self.ticket_open_view)
 
     def _register_commands(self):
         async def check_callback(ctx, *, text: str):
@@ -399,6 +400,12 @@ class Bot(commands.Bot):
 
         async def rps_callback(ctx, choice: str):
             await self.rps(ctx, choice=choice)
+
+        async def add_link_callback(ctx, *, link: str):
+            await self.add_link(ctx, link=link)
+
+        async def ticketpanel_callback(ctx):
+            await self.ticketpanel(ctx)
           
         check_cmd = commands.Command(check_callback, name='check')
         check_cmd.add_check(commands.is_owner().predicate)
@@ -429,6 +436,9 @@ class Bot(commands.Bot):
         coinflip_cmd = commands.Command(coinflip_callback, name='coinflip')
         roll_cmd = commands.Command(roll_callback, name='roll')
         rps_cmd = commands.Command(rps_callback, name='rps')
+        add_link_cmd = commands.Command(add_link_callback, name='add_link', aliases=['addlink'])
+        ticketpanel_cmd = commands.Command(ticketpanel_callback, name='ticketpanel')
+        ticketpanel_cmd.add_check(self._make_command_access_check('ticketpanel'))
 
         lastphish_cmd = commands.Command(lastphish_callback, name='lastphish')
         lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
@@ -436,9 +446,66 @@ class Bot(commands.Bot):
         for command in [
             check_cmd, help_cmd, ping_cmd, ban_cmd, kick_cmd, timeout_cmd,
             delete_cmd, cases_cmd, reply_cmd, lastphish_cmd, trivia_cmd, eightball_cmd,
-            coinflip_cmd, roll_cmd, rps_cmd
+            coinflip_cmd, roll_cmd, rps_cmd, add_link_cmd, ticketpanel_cmd
         ]:
             self.add_command(command)
+
+    async def _create_locked_ticket_from_modal(self, interaction: discord.Interaction, title: str, description: str):
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            return await interaction.response.send_message('⚠️ Tickets can only be created inside a server.', ephemeral=True)
+
+        panel_channel = self.get_channel(TICKET_CHANNEL_ID) if TICKET_CHANNEL_ID else interaction.channel
+        if panel_channel is None or not isinstance(panel_channel, discord.TextChannel):
+            return await interaction.response.send_message('⚠️ Ticket channel is not configured correctly.', ephemeral=True)
+
+        category = panel_channel.category
+        existing = discord.utils.get(guild.text_channels, topic=f'ticket_owner:{member.id}')
+        if existing:
+            return await interaction.response.send_message(f'ℹ️ You already have an open ticket: {existing.mention}', ephemeral=True)
+
+        safe_name = re.sub(r'[^a-z0-9-]+', '-', member.display_name.lower()).strip('-')
+        safe_name = safe_name[:20] or f'user-{member.id}'
+        channel_name = f'ticket-{safe_name}'
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            member: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+        }
+
+        staff_role = guild.get_role(TICKET_STAFF_ROLE_ID)
+        if staff_role is not None:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                topic=f'ticket_owner:{member.id}',
+                overwrites=overwrites,
+                reason=f'Ticket opened by {member}',
+            )
+        except Exception:
+            log.exception('Failed to create ticket channel')
+            return await interaction.response.send_message('⚠️ Failed to create ticket channel.', ephemeral=True)
+
+        embed = discord.Embed(
+            title='🎫 New Ticket (Locked)',
+            description='This ticket is currently locked. A staff member must press **Open Ticket** before the user can send messages.',
+            color=discord.Color.orange(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name='User', value=f'{member} ({member.id})', inline=False)
+        embed.add_field(name='Title', value=title[:1024], inline=False)
+        embed.add_field(name='Description', value=description[:1024], inline=False)
+
+        mention = f'<@&{TICKET_STAFF_ROLE_ID}>' if staff_role is not None else '@here'
+        await ticket_channel.send(content=f'{mention} New ticket created.', embed=embed, view=TicketOpenView(self))
+
+        self._add_case('ticket_created', member, member, title, {'description': description, 'channel_id': ticket_channel.id})
+        await interaction.response.send_message(f'✅ Ticket created: {ticket_channel.mention}', ephemeral=True)
 
     async def _fetch_trivia_questions(self, amount: int = 10):
         url = f'https://opentdb.com/api.php?amount={amount}&type=multiple'
@@ -483,6 +550,8 @@ class Bot(commands.Bot):
         if command_name == 'cases':
             return perms.manage_messages
         if command_name == 'lastphish':
+            return perms.manage_messages
+        if command_name == 'ticketpanel':
             return perms.manage_messages
         return False
 
@@ -533,6 +602,62 @@ class Bot(commands.Bot):
         with open('trivia_scores.json', 'w') as f:
             json.dump(self.trivia_scores, f, indent=2)
 
+    def _load_custom_link_patterns(self):
+        self.custom_link_patterns = []
+        if not os.path.exists(CUSTOM_LINK_PATTERNS_FILE):
+            return
+
+        try:
+            with open(CUSTOM_LINK_PATTERNS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            log.exception('Failed to load custom link patterns')
+            return
+
+        if not isinstance(data, list):
+            return
+
+        for item in data:
+            if isinstance(item, str):
+                link, pattern = '', item
+            elif isinstance(item, dict):
+                link = str(item.get('link', '')).strip()
+                pattern = str(item.get('pattern', '')).strip()
+            else:
+                continue
+
+            if not pattern:
+                continue
+            try:
+                re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                continue
+
+            self.custom_link_patterns.append({'link': link, 'pattern': pattern})
+
+    def _save_custom_link_patterns(self):
+        with open(CUSTOM_LINK_PATTERNS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.custom_link_patterns, f, indent=2)
+
+    def _refresh_custom_phish_regex(self):
+        global CUSTOM_PHISH_RE
+        if not self.custom_link_patterns:
+            CUSTOM_PHISH_RE = None
+            return
+
+        patterns = [entry.get('pattern', '') for entry in self.custom_link_patterns if isinstance(entry, dict)]
+        patterns = [p for p in patterns if p]
+        if not patterns:
+            CUSTOM_PHISH_RE = None
+            return
+
+        combined = '|'.join(f'(?:{pattern})' for pattern in patterns)
+        try:
+            CUSTOM_PHISH_RE = re.compile(combined, re.IGNORECASE)
+        except re.error:
+            log.exception('Failed to compile custom phishing regex list')
+            CUSTOM_PHISH_RE = None
+
     def _log_malicious_links(self, message: discord.Message, links):
         if not links:
             return
@@ -573,70 +698,6 @@ class Bot(commands.Bot):
 
         self.trivia_scores[uid] = entry
         self._save_trivia_scores()
-
-    async def _scan_image_attachments_for_phishing(self, attachments):
-        findings = {
-            'bad_urls': [],
-            'known_domains': [],
-            'qr_payloads': [],
-            'ocr_text_preview': '',
-        }
-
-        if not attachments:
-            return findings
-
-        if cv2 is None or np is None or pytesseract is None or Image is None:
-            log.warning('OCR dependencies missing. Install opencv-python, numpy, pillow, pytesseract, pyzbar')
-            return findings
-
-        aggregated_text = []
-        bad_urls = set()
-        known_domains = set()
-        qr_payloads = set()
-
-        for attachment in attachments:
-            content_type = (attachment.content_type or '').lower()
-            filename = (attachment.filename or '').lower()
-            if not (content_type.startswith('image/') or filename.endswith(IMAGE_EXTENSIONS)):
-                continue
-
-            if attachment.size > 8 * 1024 * 1024:
-                # Skip very large files to avoid blocking event processing.
-                continue
-
-            try:
-                image_bytes = await attachment.read()
-            except Exception:
-                continue
-
-            preprocessed = _build_preprocessed_images(image_bytes)
-            if not preprocessed:
-                continue
-
-            ocr_text = _ocr_from_images(preprocessed)
-            if ocr_text:
-                aggregated_text.append(ocr_text)
-
-            for payload in _decode_qr_payloads(preprocessed):
-                qr_payloads.add(payload)
-                for url in _extract_urls_for_analysis(payload):
-                    if is_phish(url):
-                        bad_urls.add(url)
-                for domain in _find_known_phishing_domains(payload):
-                    known_domains.add(domain)
-
-        full_ocr_text = '\n'.join(aggregated_text)
-        for url in _extract_urls_for_analysis(full_ocr_text):
-            if is_phish(url):
-                bad_urls.add(url)
-        for domain in _find_known_phishing_domains(full_ocr_text):
-            known_domains.add(domain)
-
-        findings['bad_urls'] = sorted(bad_urls)
-        findings['known_domains'] = sorted(known_domains)
-        findings['qr_payloads'] = sorted(qr_payloads)
-        findings['ocr_text_preview'] = _normalize_extracted_text(full_ocr_text)[:1000]
-        return findings
 
     def _format_trivia_leaderboard(self, limit: int = 5):
         rows = []
@@ -709,54 +770,17 @@ class Bot(commands.Bot):
         return True
     
     async def _handle_dm_ticket(self, message: discord.Message):
-        if TICKET_CHANNEL_ID == 0:
-            try:
-                await message.channel.send('⚠️ Ticket system is not configured yet. Please try again later.')
-            except Exception:
-                pass
-            return
-
-        ticket_channel = self.get_channel(TICKET_CHANNEL_ID)
-        if ticket_channel is None:
-            try:
-                await message.channel.send('⚠️ Ticket channel was not found. Please contact an admin.')
-            except Exception:
-                pass
-            return
-
-        content = (message.content or '').strip()
-        if not content and not message.attachments:
-            try:
-                await message.channel.send('⚠️ Please send some text or an attachment for your ticket.')
-            except Exception:
-                pass
-            return
-
-        embed = discord.Embed(
-            title='🎫 New DM Ticket',
-            color=discord.Color.blurple(),
-            timestamp=datetime.utcnow()
-        )
-        embed.add_field(name='User', value=f'{message.author} ({message.author.id})', inline=False)
-        embed.add_field(name='Message', value=content[:1000] if content else '(No text content)', inline=False)
-
-        if message.attachments:
-            files = '\n'.join(f'{a.filename}: {a.url}' for a in message.attachments)
-            embed.add_field(name='Attachments', value=files[:1000], inline=False)
-
         try:
-            await ticket_channel.send(embed=embed)
-            await message.channel.send('✅ Your ticket has been sent to the moderation team.')
+            await message.channel.send(
+                '🎫 This bot now uses an in-server ticket system. Please use the **Create Ticket** button in the server ticket panel.'
+            )
         except Exception:
-            log.exception('Failed to forward DM ticket')
-            try:
-                await message.channel.send('⚠️ Failed to submit your ticket. Please try again later.')
-            except Exception:
-                pass
+            pass
 
     async def on_ready(self):
         log.info(f'Logged in as {self.user}')
         log.info('Loaded commands: %s', ', '.join(sorted(c.name for c in self.commands)))
+        log.info('Loaded custom phishing patterns: %s', len(self.custom_link_patterns))
         for cmd in sorted(COMMAND_ROLE_ACCESS.keys()):
             role_ids = self._get_configured_role_ids(cmd)
             if len(COMMAND_ROLE_ACCESS.get(cmd, [])) > MAX_ROLES_PER_COMMAND:
@@ -808,30 +832,17 @@ class Bot(commands.Bot):
 
         urls = _extract_urls_for_analysis(message.content)
         bad = [u for u in urls if is_phish(u)]
-        ocr_findings = await self._scan_image_attachments_for_phishing(message.attachments)
-        merged_bad_urls = sorted(set(bad + ocr_findings.get('bad_urls', [])))
-        known_domains = ocr_findings.get('known_domains', [])
-        qr_payloads = ocr_findings.get('qr_payloads', [])
 
-        if merged_bad_urls or known_domains:
-            self._log_malicious_links(message, merged_bad_urls or known_domains)
+        if bad:
+            self._log_malicious_links(message, bad)
             try: await message.delete()
             except: pass
-            evidence_parts = []
-            if merged_bad_urls:
-                evidence_parts.append('URLs:\n' + '\n'.join(merged_bad_urls[:10]))
-            if known_domains:
-                evidence_parts.append('Known phishing domains:\n' + '\n'.join(known_domains[:10]))
-            if qr_payloads:
-                evidence_parts.append('QR payloads:\n' + '\n'.join(qr_payloads[:5]))
-            if ocr_findings.get('ocr_text_preview'):
-                evidence_parts.append('OCR text preview:\n' + ocr_findings['ocr_text_preview'])
 
-            await self._quarantine_user(message, 'Malicious link/domain detected (text or image OCR)', '\n\n'.join(evidence_parts)[:1500])
+            evidence = 'URLs:\n' + '\n'.join(bad[:10])
+            await self._quarantine_user(message, 'Malicious link detected in text', evidence[:1500])
             try:
-                removal_summary = merged_bad_urls if merged_bad_urls else known_domains
                 await message.channel.send(
-                    f'⚠️ Phishing removed: {" ".join(removal_summary[:5])}',
+                    f'⚠️ Phishing removed: {" ".join(bad[:5])}',
                     delete_after=10,
                 )
             except Exception:
@@ -849,15 +860,8 @@ class Bot(commands.Bot):
                 timestamp=datetime.utcnow()
             )
             embed.add_field(name='User', value=f'{message.author} ({message.author.id})', inline=False)
-            if merged_bad_urls:
-                embed.add_field(name='Detected URL(s)', value='\n'.join(merged_bad_urls)[:1000], inline=False)
-            if known_domains:
-                embed.add_field(name='Known phishing domains', value='\n'.join(known_domains)[:1000], inline=False)
-            if qr_payloads:
-                embed.add_field(name='Decoded QR payload(s)', value='\n'.join(qr_payloads)[:1000], inline=False)
+            embed.add_field(name='Detected URL(s)', value='\n'.join(bad)[:1000], inline=False)
             embed.add_field(name='Channel', value=message.channel.mention, inline=False)
-            if ocr_findings.get('ocr_text_preview'):
-                embed.add_field(name='OCR text preview', value=ocr_findings['ocr_text_preview'], inline=False)
 
             try:
                 await log_channel.send(embed=embed)
@@ -926,18 +930,41 @@ class Bot(commands.Bot):
             color=discord.Color.blurple(),
             timestamp=datetime.utcnow()
         )
-        embed.add_field(name='DM Ticket', value='Send me a DM and I will forward it to the staff ticket channel.', inline=False)
+        embed.add_field(name='DM Ticket', value='DMs are disabled for ticket intake. Use the server ticket panel button instead.', inline=False)
         embed.add_field(name=f'{PREFIX}ping', value='Quick command test (bot should reply Pong).', inline=False)
         embed.add_field(name=f'{PREFIX}check <text/link>', value='Owner-only manual check for suspicious links.', inline=False)
         embed.add_field(name=f'{PREFIX}ban <member> [reason]', value='Ban a member.', inline=False)
         embed.add_field(name=f'{PREFIX}kick <member> [reason]', value='Kick a member.', inline=False)
         embed.add_field(name=f'{PREFIX}timeout <member> <duration> [reason]', value='Timeout format: 1d / 2h / 30m / 60s.', inline=False)
         embed.add_field(name=f'{PREFIX}clear [amount]', value='Delete 1-100 messages. Alias: delete.', inline=False)
+        embed.add_field(name=f'{PREFIX}add_link <link>', value='Add a phishing link pattern that everyone can report for future auto-detection.', inline=False)
         embed.add_field(name=f'{PREFIX}reply <user_id> <message>', value='Reply to a user who opened a DM ticket.', inline=False)
         embed.add_field(name=f'{PREFIX}cases [member]', value='Show stored moderation cases.', inline=False)
         embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
         embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
+        embed.add_field(name=f'{PREFIX}ticketpanel', value='Post the ticket panel with a Create Ticket button (staff only).', inline=False)
+        embed.add_field(name='Ticket Buttons', value='Staff can use Open Ticket and Close Ticket buttons inside each ticket channel.', inline=False)
         await ctx.send(embed=embed)
+
+    async def ticketpanel(self, ctx):
+        if self.ticket_panel_view is None:
+            self.ticket_panel_view = TicketPanelView(self)
+            self.add_view(self.ticket_panel_view)
+
+        panel_channel = self.get_channel(TICKET_CHANNEL_ID) if TICKET_CHANNEL_ID else ctx.channel
+        if panel_channel is None or not isinstance(panel_channel, discord.TextChannel):
+            return await ctx.send('⚠️ Ticket channel is not configured correctly.')
+
+        embed = discord.Embed(
+            title='🎫 Support Tickets',
+            description='Press **Create Ticket** to open a support ticket. You will provide a title and description, then staff will unlock your ticket.',
+            color=discord.Color.blurple(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name='How it works', value='1) Press the button\n2) Fill in title and description\n3) Wait for staff to open the ticket', inline=False)
+        await panel_channel.send(embed=embed, view=self.ticket_panel_view)
+        if panel_channel.id != ctx.channel.id:
+            await ctx.send(f'✅ Ticket panel posted in {panel_channel.mention}.')
 
     async def cmdhelp(self, ctx):
         await self.cmd_help(ctx)
@@ -969,6 +996,35 @@ class Bot(commands.Bot):
         self._add_case('delete', 'system', ctx.author, f'deleted {amt}')
         msg=await ctx.send(f'✅ Deleted {amt} messages')
         await msg.delete(delay=5)
+
+    async def add_link(self, ctx, *, link: str):
+        normalized_link, pattern = _build_phish_pattern_from_link(link)
+        if not normalized_link or not pattern:
+            return await ctx.send('⚠️ Please provide a valid link or domain. Example: `=add_link bad-domain.com/login`')
+
+        existing = [item.get('pattern') for item in self.custom_link_patterns if isinstance(item, dict)]
+        if pattern in existing:
+            return await ctx.send('ℹ️ That phishing link pattern is already in the detection list.')
+
+        self.custom_link_patterns.append(
+            {
+                'link': normalized_link,
+                'pattern': pattern,
+                'added_by': ctx.author.id,
+                'added_at': datetime.utcnow().isoformat(),
+            }
+        )
+        self._save_custom_link_patterns()
+        self._refresh_custom_phish_regex()
+
+        self._add_case(
+            'add_link',
+            ctx.author,
+            ctx.author,
+            f'Added phishing link pattern: {normalized_link}',
+            {'pattern': pattern}
+        )
+        await ctx.send(f'✅ Added phishing pattern for `{normalized_link}`. Future matching links will be auto-flagged.')
 
     async def cases(self, ctx, member: discord.Member=None):
         if member is None: member = ctx.author
