@@ -24,6 +24,7 @@ QUARANTINE_ROLE_ID = _env_int('QUARANTINE_ROLE_ID', 0)
 MALICIOUS_LINK_LOG_FILE = 'malicious_links.log'
 CUSTOM_LINK_PATTERNS_FILE = 'custom_link_patterns.json'
 LOCKDOWN_STATE_FILE = 'lockdown_state.json'
+BOT_SETTINGS_FILE = 'bot_settings.json'
 CUSTOM_PHISH_RE = None
 
 # Command role access (up to 8 role IDs per command).
@@ -38,6 +39,7 @@ COMMAND_ROLE_ACCESS = {
     'cases': [],
     'lastphish': [],
     'ticketpanel': [],
+    'setlogchannel': [],
     'lockall': [],
     'editlockmsg': [],
     'unlock': [],
@@ -356,6 +358,9 @@ class Bot(commands.Bot):
         self.case_records = []
         self.trivia_scores = {}
         self.custom_link_patterns = []
+        self.settings = {
+            'log_channel_id': LOG_CHANNEL_ID,
+        }
         self.lockdown_state = {
             'active': False,
             'temp_channel_id': None,
@@ -369,6 +374,7 @@ class Bot(commands.Bot):
         self._load_cases()
         self._load_trivia_scores()
         self._load_custom_link_patterns()
+        self._load_settings()
         self._load_lockdown_state()
         self._refresh_custom_phish_regex()
         self._register_commands()
@@ -432,6 +438,9 @@ class Bot(commands.Bot):
         async def ticketpanel_callback(ctx):
             await self.ticketpanel(ctx)
 
+        async def setlogchannel_callback(ctx, channel: discord.TextChannel = None):
+            await self.setlogchannel(ctx, channel=channel)
+
         async def lockall_callback(ctx, *, message: str = None):
             await self.lockall(ctx, message=message)
 
@@ -477,6 +486,9 @@ class Bot(commands.Bot):
         ticketpanel_cmd = commands.Command(ticketpanel_callback, name='ticketpanel')
         ticketpanel_cmd.add_check(self._make_command_access_check('ticketpanel'))
 
+        setlogchannel_cmd = commands.Command(setlogchannel_callback, name='setlogchannel', aliases=['logchannel'])
+        setlogchannel_cmd.add_check(self._make_command_access_check('setlogchannel'))
+
         lockall_cmd = commands.Command(lockall_callback, name='lockall')
         lockall_cmd.add_check(self._make_command_access_check('lockall'))
 
@@ -496,9 +508,99 @@ class Bot(commands.Bot):
             check_cmd, help_cmd, ping_cmd, ban_cmd, kick_cmd, timeout_cmd,
             delete_cmd, cases_cmd, reply_cmd, lastphish_cmd, trivia_cmd, eightball_cmd,
             coinflip_cmd, roll_cmd, rps_cmd, add_link_cmd, ticketpanel_cmd,
+            setlogchannel_cmd,
             lockall_cmd, editlockmsg_cmd, unlock_cmd, unlockall_cmd
         ]:
             self.add_command(command)
+
+    def _load_settings(self):
+        if not os.path.exists(BOT_SETTINGS_FILE):
+            return
+        try:
+            with open(BOT_SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            log.exception('Failed to load bot settings')
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        log_channel_id = data.get('log_channel_id', LOG_CHANNEL_ID)
+        try:
+            self.settings['log_channel_id'] = int(log_channel_id)
+        except Exception:
+            self.settings['log_channel_id'] = LOG_CHANNEL_ID
+
+    def _save_settings(self):
+        try:
+            with open(BOT_SETTINGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=2)
+        except Exception:
+            log.exception('Failed to save bot settings')
+
+    def _get_log_channel_id(self) -> int:
+        try:
+            return int(self.settings.get('log_channel_id', LOG_CHANNEL_ID) or 0)
+        except Exception:
+            return 0
+
+    def _resolve_log_channel(self, guild: discord.Guild = None):
+        channel_id = self._get_log_channel_id()
+        if channel_id <= 0:
+            return None
+        channel = self.get_channel(channel_id)
+        if channel is None and guild is not None:
+            channel = guild.get_channel(channel_id)
+        return channel
+
+    async def _send_embed_to_log_channel(self, embed: discord.Embed, guild: discord.Guild = None):
+        log_channel = self._resolve_log_channel(guild=guild)
+        if log_channel is None:
+            return False
+        try:
+            await log_channel.send(embed=embed)
+            return True
+        except Exception:
+            log.exception('Failed to send embed to configured log channel')
+            return False
+
+    async def _send_case_embed(self, case: dict):
+        if not isinstance(case, dict):
+            return
+
+        guild = None
+        guild_id = case.get('guild_id')
+        if guild_id:
+            try:
+                guild = self.get_guild(int(guild_id))
+            except Exception:
+                guild = None
+
+        embed = discord.Embed(
+            title='🗃️ Moderation Case Logged',
+            color=discord.Color.blue(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name='Case ID', value=str(case.get('id', 'Unknown')), inline=True)
+        embed.add_field(name='Type', value=str(case.get('type', 'Unknown')), inline=True)
+        embed.add_field(name='Moderator', value=str(case.get('mod', 'Unknown'))[:1024], inline=False)
+        embed.add_field(name='User', value=str(case.get('user', 'Unknown'))[:1024], inline=False)
+        embed.add_field(name='Reason', value=str(case.get('reason', 'No reason'))[:1024], inline=False)
+        await self._send_embed_to_log_channel(embed, guild=guild)
+
+    async def _send_malicious_link_embed(self, message: discord.Message, links):
+        if not links:
+            return
+        embed = discord.Embed(
+            title='🚨 Malicious Link Logged',
+            color=discord.Color.red(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name='User', value=f'{message.author} ({message.author.id})', inline=False)
+        embed.add_field(name='Channel', value=message.channel.mention if message.channel else 'Unknown', inline=False)
+        embed.add_field(name='Detected URL(s)', value='\n'.join(str(link) for link in links[:10])[:1000], inline=False)
+        await self._send_embed_to_log_channel(embed, guild=message.guild)
 
     @staticmethod
     def _serialize_overwrite(overwrite: discord.PermissionOverwrite):
@@ -515,6 +617,14 @@ class Bot(commands.Bot):
         except Exception:
             return None
         return discord.PermissionOverwrite.from_pair(allow, deny)
+
+    @staticmethod
+    def _is_onboarding_readable_error(exc: Exception) -> bool:
+        if not isinstance(exc, discord.HTTPException):
+            return False
+        if getattr(exc, 'code', None) != 350003:
+            return False
+        return 'Onboarding channels must be readable by everyone' in str(exc)
 
     def _save_lockdown_state(self):
         try:
@@ -827,6 +937,11 @@ class Bot(commands.Bot):
         except Exception:
             log.exception('Failed to write malicious link log entry')
 
+        try:
+            asyncio.create_task(self._send_malicious_link_embed(message, links))
+        except Exception:
+            pass
+
     def _update_trivia_leaderboard(self, user: discord.abc.User, correct: bool):
         uid = str(user.id)
         entry = self.trivia_scores.get(uid)
@@ -873,6 +988,10 @@ class Bot(commands.Bot):
         if extra: case.update(extra)
         self.case_records.append(case)
         self._save_cases()
+        try:
+            asyncio.create_task(self._send_case_embed(case))
+        except Exception:
+            pass
         return case
     
     async def _quarantine_user(self, message, trigger: str, evidence: str = ''):
@@ -929,6 +1048,7 @@ class Bot(commands.Bot):
         log.info(f'Logged in as {self.user}')
         log.info('Loaded commands: %s', ', '.join(sorted(c.name for c in self.commands)))
         log.info('Loaded custom phishing patterns: %s', len(self.custom_link_patterns))
+        log.info('Configured log channel ID: %s', self._get_log_channel_id())
         for cmd in sorted(COMMAND_ROLE_ACCESS.keys()):
             role_ids = self._get_configured_role_ids(cmd)
             if len(COMMAND_ROLE_ACCESS.get(cmd, [])) > MAX_ROLES_PER_COMMAND:
@@ -953,10 +1073,6 @@ class Bot(commands.Bot):
             except: pass
             await self._quarantine_user(message, 'Bot token detected', f'{token_match.group(0)[:12]}...')
 
-            log_channel = self.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else message.channel
-            if log_channel is None:
-                log_channel = message.channel
-
             token_embed = discord.Embed(
                 title='🚨 Bot Token Caught',
                 color=discord.Color.dark_red(),
@@ -966,10 +1082,7 @@ class Bot(commands.Bot):
             token_embed.add_field(name='Channel', value=message.channel.mention, inline=False)
             token_embed.add_field(name='Token (masked)', value=f'`{token_match.group(0)[:12]}...`', inline=False)
 
-            try:
-                await log_channel.send(embed=token_embed)
-            except Exception:
-                pass
+            await self._send_embed_to_log_channel(token_embed, guild=message.guild)
 
             try:
                 await message.channel.send('⚠️ Potential bot token removed for safety.', delete_after=10)
@@ -996,12 +1109,6 @@ class Bot(commands.Bot):
             except Exception:
                 pass
               
-            log_channel = None
-            if LOG_CHANNEL_ID:
-                log_channel = self.get_channel(LOG_CHANNEL_ID)
-            if log_channel is None:
-                log_channel = message.channel
-
             embed = discord.Embed(
                 title='🚨 Phishing Link Caught',
                 color=discord.Color.red(),
@@ -1011,10 +1118,7 @@ class Bot(commands.Bot):
             embed.add_field(name='Detected URL(s)', value='\n'.join(bad)[:1000], inline=False)
             embed.add_field(name='Channel', value=message.channel.mention, inline=False)
 
-            try:
-                await log_channel.send(embed=embed)
-            except Exception:
-                pass
+            await self._send_embed_to_log_channel(embed, guild=message.guild)
         await self.process_commands(message)
 
     async def on_command_error(self, ctx, error):
@@ -1091,12 +1195,26 @@ class Bot(commands.Bot):
         embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
         embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
         embed.add_field(name=f'{PREFIX}ticketpanel', value='Post the ticket panel with a Create Ticket button (staff only).', inline=False)
+        embed.add_field(name=f'{PREFIX}setlogchannel [#channel]', value='Set the channel used for embed logs (cases and phishing/security events).', inline=False)
         embed.add_field(name=f'{PREFIX}lockall [message]', value='Lock all channels to lockdown role and create/update a temporary status channel.', inline=False)
         embed.add_field(name=f'{PREFIX}editlockmsg <message>', value='Edit the lockdown status message in the temporary channel.', inline=False)
         embed.add_field(name=f'{PREFIX}unlock [channel_id]', value='Unlock one channel (defaults to current channel).', inline=False)
         embed.add_field(name=f'{PREFIX}unlockall', value='Unlock all locked channels and delete the temporary status channel.', inline=False)
         embed.add_field(name='Ticket Buttons', value='Staff can use Open Ticket and Close Ticket buttons inside each ticket channel.', inline=False)
         await ctx.send(embed=embed)
+
+    async def setlogchannel(self, ctx, channel: discord.TextChannel = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        target = channel if channel is not None else ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            return await ctx.send('⚠️ Please choose a text channel.')
+
+        self.settings['log_channel_id'] = target.id
+        self._save_settings()
+        await ctx.send(f'✅ Log channel set to {target.mention}. New log events will be sent there as embeds.')
 
     async def lockall(self, ctx, *, message: str = None):
         guild = ctx.guild
@@ -1133,6 +1251,7 @@ class Bot(commands.Bot):
         locked_ids = set(self.lockdown_state.get('locked_channel_ids', []))
         channel_overwrites = self.lockdown_state.get('channel_overwrites', {})
         changed = 0
+        skipped_onboarding = []
 
         for channel in guild.channels:
             if channel.id == temp_channel.id:
@@ -1151,9 +1270,13 @@ class Bot(commands.Bot):
             try:
                 await channel.set_permissions(guild.default_role, view_channel=False, reason=f'Lockdown initiated by {ctx.author}')
                 await channel.set_permissions(lock_role, view_channel=True, reason=f'Lockdown initiated by {ctx.author}')
-            except Exception:
-                log.exception('Failed to lock channel %s', channel.id)
+            except Exception as exc:
                 channel_overwrites.pop(str(channel.id), None)
+                if self._is_onboarding_readable_error(exc):
+                    skipped_onboarding.append(channel)
+                    log.warning('Skipped onboarding channel %s (%s) during lockdown', channel.id, getattr(channel, 'name', 'unknown'))
+                    continue
+                log.exception('Failed to lock channel %s', channel.id)
                 continue
 
             locked_ids.add(channel.id)
@@ -1188,7 +1311,17 @@ class Bot(commands.Bot):
         self._save_lockdown_state()
 
         self._add_case('lockdown_all', guild.name, ctx.author, f'Locked {changed} channels', {'temp_channel_id': temp_channel.id})
-        await ctx.send(f'🔒 Lockdown active. Updated {changed} channel(s). Status channel: {temp_channel.mention}')
+        if skipped_onboarding:
+            skipped_text = ', '.join(ch.mention for ch in skipped_onboarding[:10])
+            extra = ''
+            if len(skipped_onboarding) > 10:
+                extra = f' (+{len(skipped_onboarding) - 10} more)'
+            await ctx.send(
+                f'🔒 Lockdown active. Updated {changed} channel(s). Status channel: {temp_channel.mention}\n'
+                f'⚠️ Skipped onboarding-only channel(s): {skipped_text}{extra}'
+            )
+        else:
+            await ctx.send(f'🔒 Lockdown active. Updated {changed} channel(s). Status channel: {temp_channel.mention}')
 
     async def editlockmsg(self, ctx, *, message: str):
         guild = ctx.guild
