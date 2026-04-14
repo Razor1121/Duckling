@@ -44,3 +44,8 @@ Thumbs.db
 # Bot runtime
 ignored/
 node_modules/
+cases.json
+trivia_scores.json
+custom_link_patterns.json
+lockdown_state.json
+malicious_links.log

@@ -1,84 +1,99 @@
-# Anti-Phishing Discord Bot
+# Anti-Phish Discord Bot
 
-## Overview
+Discord bot focused on phishing prevention, moderation utilities, in-server tickets, and server lockdown controls.
 
-This Discord bot is designed to help keep servers safe from phishing links and malicious messages while also providing useful moderation and support tools. It automatically scans messages for suspicious links using an advanced phishing detection algorithm and can take action to prevent harmful content from spreading.
+## Current Features
 
-In addition to phishing protection, the bot includes basic moderation commands and an in-server button-based ticket system so users can easily contact server staff for help.
+### 1) Anti-phishing detection
+- Detects suspicious links from message text using regex and heuristic scoring.
+- Deletes malicious messages when detected.
+- Logs incidents to `malicious_links.log`.
+- Stores moderation-style case records in `cases.json`.
 
----
+### 2) Moderation and utility commands
+- `=help`
+- `=ping`
+- `=ban <member> [reason]`
+- `=kick <member> [reason]`
+- `=timeout <member> <duration> [reason]`
+- `=delete [amount]` (alias: `=clear`)
+- `=cases [member]`
+- `=reply <user_id> <message>`
+- `=lastphish`
+- `=check <text/link>` (owner-only)
+- `=add_link <link>`
 
-## Features
+### 3) Ticket system
+- `=ticketpanel` posts a panel with a **Create Ticket** button.
+- User submits title + description in modal.
+- Ticket starts locked for user messaging until staff presses **Open Ticket**.
+- Staff can close with **Close Ticket**.
 
-### Advanced Phishing Detection
+### 4) Lockdown system (new)
+- `=lockall [message]`
+	- Locks all channels to the configured lockdown role.
+	- Creates/reuses a temporary `server-status` channel.
+	- Posts a status embed message.
+- `=editlockmsg <message>` (alias: `=lockmsg`)
+	- Edits the lockdown message in the temporary status channel.
+- `=unlock [channel_id]`
+	- Unlocks a single channel and restores previous permission overwrites.
+	- If `channel_id` is omitted, unlocks the current channel.
+- `=unlockall`
+	- Restores all channels locked by `=lockall`.
+	- Deletes the temporary status channel.
 
-The bot monitors messages for potentially dangerous links. When a suspicious or known phishing link is detected, the bot can automatically:
+## Public-Safe Configuration
 
-* Delete the message
-* Warn or mute the user
-* Alert moderators
-* Log the event for review
+Do not hardcode secrets or private IDs in source files. This project now reads runtime config from environment variables.
 
-The detection system analyzes link structure, domain reputation, and common phishing patterns to reduce false positives while maintaining strong protection.
+Required:
+- `BOT_TOKEN` = your Discord bot token
 
----
+Optional:
+- `BOT_PREFIX` (default: `=`)
+- `LOG_CHANNEL_ID` (default: `0`)
+- `TICKET_CHANNEL_ID` (default: `0`)
+- `TICKET_STAFF_ROLE_ID` (default: `0`)
+- `LOCKDOWN_ROLE_ID` (default: value of `TICKET_STAFF_ROLE_ID`)
+- `QUARANTINE_ROLE_ID` (default: `0`)
 
-### Moderation Commands
+PowerShell example:
 
-The bot includes several basic moderation tools to help staff manage the server:
+```powershell
+$env:BOT_TOKEN="YOUR_TOKEN_HERE"
+$env:TICKET_STAFF_ROLE_ID="123456789012345678"
+$env:LOCKDOWN_ROLE_ID="123456789012345678"
+python bot.py
+```
 
-* `prefix = "="`
-* `ban` – Ban a user from the server
-* `kick` – Kick a user from the server
-* `timeout` – Temporarily mute a user
-* `warn` – Issue a warning to a user
-* `clear` – Bulk delete messages from a channel
-* `help` - Lists every command currently accessible with the bot
-* `add_link` - Allow users to submit a phishing link/domain so the bot will auto-detect it in future messages
-* `ticketpanel` - Staff command to post the ticket panel with a **Create Ticket** button
+## Setup
 
-These commands help moderators quickly respond to rule violations.
+1. Install dependencies:
 
----
+```powershell
+pip install -r requirements.txt
+```
 
-### Ticket System
+2. Set environment variables (see above).
 
-Users can create support tickets in-server using buttons and a modal. The flow is:
+3. Run the bot:
 
-1. Staff posts the ticket panel using `=ticketpanel`.
-2. A user presses **Create Ticket**.
-3. The user submits a **title** and **description** in a modal.
-4. The bot creates a temporary private ticket channel.
-5. The user is locked from sending messages until staff opens the ticket.
-6. A staff member with the configured staff role can press **Open Ticket**.
-7. Staff can press **Close Ticket** to delete the temporary ticket channel.
+```powershell
+python bot.py
+```
 
-This system allows users to privately report issues, ask questions, or request assistance in a controlled ticket workflow.
+## Files Created At Runtime
 
----
+- `cases.json`
+- `trivia_scores.json`
+- `custom_link_patterns.json`
+- `lockdown_state.json`
+- `malicious_links.log`
 
-## How It Works
+These files may contain server/user data and should not be committed to public repos.
 
-1. The bot listens to messages sent in the server.
-2. Links are analyzed by the phishing detection system.
-3. Suspicious messages are flagged or removed automatically.
-4. Moderators can use commands to manage users and server activity.
-5. Users can open support tickets through the in-server ticket panel.
+## Notes
 
----
-
-## Purpose
-
-The goal of this bot is to create a safer Discord environment by combining automated phishing protection with essential moderation tools and a simple support system.
-
----
-
-## Disclaimer
-
-The code is not bulletproof, however it does have a decent list of regexes and other random websites that it will catch.
-
-## Setup Notes
-
-1. Install Python dependencies from `requirements.txt`.
-
-The bot scans message text for links and suspicious patterns. Image attachments are not scanned.
+- The detector is heuristic-based and can produce false positives/false negatives.
+- Scanning currently targets text content, not image OCR.

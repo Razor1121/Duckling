@@ -4,14 +4,26 @@ from datetime import datetime, timedelta
 import discord
 from discord.ext import commands
 
-TOKEN = "Paste your bot token here"
-PREFIX = '='
-LOG_CHANNEL_ID = 0
-TICKET_CHANNEL_ID = 0
-TICKET_STAFF_ROLE_ID = 1443345576832925888
-QUARANTINE_ROLE_ID = 0
+def _env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+TOKEN = os.getenv('BOT_TOKEN', '').strip()
+PREFIX = os.getenv('BOT_PREFIX', '=')
+LOG_CHANNEL_ID = _env_int('LOG_CHANNEL_ID', 0)
+TICKET_CHANNEL_ID = _env_int('TICKET_CHANNEL_ID', 0)
+TICKET_STAFF_ROLE_ID = _env_int('TICKET_STAFF_ROLE_ID', 0)
+LOCKDOWN_ROLE_ID = _env_int('LOCKDOWN_ROLE_ID', TICKET_STAFF_ROLE_ID)
+QUARANTINE_ROLE_ID = _env_int('QUARANTINE_ROLE_ID', 0)
 MALICIOUS_LINK_LOG_FILE = 'malicious_links.log'
 CUSTOM_LINK_PATTERNS_FILE = 'custom_link_patterns.json'
+LOCKDOWN_STATE_FILE = 'lockdown_state.json'
 CUSTOM_PHISH_RE = None
 
 # Command role access (up to 8 role IDs per command).
@@ -26,6 +38,10 @@ COMMAND_ROLE_ACCESS = {
     'cases': [],
     'lastphish': [],
     'ticketpanel': [],
+    'lockall': [],
+    'editlockmsg': [],
+    'unlock': [],
+    'unlockall': [],
 }
 MAX_ROLES_PER_COMMAND = 8
 
@@ -340,11 +356,20 @@ class Bot(commands.Bot):
         self.case_records = []
         self.trivia_scores = {}
         self.custom_link_patterns = []
+        self.lockdown_state = {
+            'active': False,
+            'temp_channel_id': None,
+            'info_message_id': None,
+            'info_text': '',
+            'locked_channel_ids': [],
+            'channel_overwrites': {},
+        }
         self.ticket_panel_view = None
         self.ticket_open_view = None
         self._load_cases()
         self._load_trivia_scores()
         self._load_custom_link_patterns()
+        self._load_lockdown_state()
         self._refresh_custom_phish_regex()
         self._register_commands()
 
@@ -406,6 +431,18 @@ class Bot(commands.Bot):
 
         async def ticketpanel_callback(ctx):
             await self.ticketpanel(ctx)
+
+        async def lockall_callback(ctx, *, message: str = None):
+            await self.lockall(ctx, message=message)
+
+        async def editlockmsg_callback(ctx, *, message: str):
+            await self.editlockmsg(ctx, message=message)
+
+        async def unlock_callback(ctx, channel_id: int = None):
+            await self.unlock(ctx, channel_id=channel_id)
+
+        async def unlockall_callback(ctx):
+            await self.unlockall(ctx)
           
         check_cmd = commands.Command(check_callback, name='check')
         check_cmd.add_check(commands.is_owner().predicate)
@@ -440,15 +477,116 @@ class Bot(commands.Bot):
         ticketpanel_cmd = commands.Command(ticketpanel_callback, name='ticketpanel')
         ticketpanel_cmd.add_check(self._make_command_access_check('ticketpanel'))
 
+        lockall_cmd = commands.Command(lockall_callback, name='lockall')
+        lockall_cmd.add_check(self._make_command_access_check('lockall'))
+
+        editlockmsg_cmd = commands.Command(editlockmsg_callback, name='editlockmsg', aliases=['lockmsg'])
+        editlockmsg_cmd.add_check(self._make_command_access_check('editlockmsg'))
+
+        unlock_cmd = commands.Command(unlock_callback, name='unlock')
+        unlock_cmd.add_check(self._make_command_access_check('unlock'))
+
+        unlockall_cmd = commands.Command(unlockall_callback, name='unlockall')
+        unlockall_cmd.add_check(self._make_command_access_check('unlockall'))
+
         lastphish_cmd = commands.Command(lastphish_callback, name='lastphish')
         lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
 
         for command in [
             check_cmd, help_cmd, ping_cmd, ban_cmd, kick_cmd, timeout_cmd,
             delete_cmd, cases_cmd, reply_cmd, lastphish_cmd, trivia_cmd, eightball_cmd,
-            coinflip_cmd, roll_cmd, rps_cmd, add_link_cmd, ticketpanel_cmd
+            coinflip_cmd, roll_cmd, rps_cmd, add_link_cmd, ticketpanel_cmd,
+            lockall_cmd, editlockmsg_cmd, unlock_cmd, unlockall_cmd
         ]:
             self.add_command(command)
+
+    @staticmethod
+    def _serialize_overwrite(overwrite: discord.PermissionOverwrite):
+        allow, deny = overwrite.pair()
+        return {'allow': allow.value, 'deny': deny.value}
+
+    @staticmethod
+    def _deserialize_overwrite(data):
+        if not isinstance(data, dict):
+            return None
+        try:
+            allow = discord.Permissions(int(data.get('allow', 0)))
+            deny = discord.Permissions(int(data.get('deny', 0)))
+        except Exception:
+            return None
+        return discord.PermissionOverwrite.from_pair(allow, deny)
+
+    def _save_lockdown_state(self):
+        try:
+            with open(LOCKDOWN_STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self.lockdown_state, f, indent=2)
+        except Exception:
+            log.exception('Failed to save lockdown state')
+
+    def _load_lockdown_state(self):
+        if not os.path.exists(LOCKDOWN_STATE_FILE):
+            return
+        try:
+            with open(LOCKDOWN_STATE_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            log.exception('Failed to load lockdown state')
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        self.lockdown_state['active'] = bool(data.get('active', False))
+        self.lockdown_state['temp_channel_id'] = data.get('temp_channel_id')
+        self.lockdown_state['info_message_id'] = data.get('info_message_id')
+        self.lockdown_state['info_text'] = str(data.get('info_text', ''))
+
+        ids = data.get('locked_channel_ids', [])
+        if isinstance(ids, list):
+            parsed_ids = []
+            for value in ids:
+                try:
+                    parsed_ids.append(int(value))
+                except Exception:
+                    continue
+            self.lockdown_state['locked_channel_ids'] = parsed_ids
+
+        overwrites = data.get('channel_overwrites', {})
+        if isinstance(overwrites, dict):
+            self.lockdown_state['channel_overwrites'] = overwrites
+
+    async def _restore_channel_from_lockdown(self, guild: discord.Guild, channel_id: int, lock_role: discord.Role):
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            return False
+
+        before = self.lockdown_state.get('channel_overwrites', {}).get(str(channel_id), {})
+        everyone_data = before.get('everyone') if isinstance(before, dict) else None
+        role_data = before.get('role') if isinstance(before, dict) else None
+
+        everyone_overwrite = self._deserialize_overwrite(everyone_data)
+        role_overwrite = self._deserialize_overwrite(role_data)
+
+        try:
+            if everyone_overwrite is None:
+                await channel.set_permissions(guild.default_role, overwrite=None, reason='Lockdown: unlock restore')
+            else:
+                await channel.set_permissions(guild.default_role, overwrite=everyone_overwrite, reason='Lockdown: unlock restore')
+
+            if role_overwrite is None:
+                await channel.set_permissions(lock_role, overwrite=None, reason='Lockdown: unlock restore')
+            else:
+                await channel.set_permissions(lock_role, overwrite=role_overwrite, reason='Lockdown: unlock restore')
+        except Exception:
+            log.exception('Failed to restore channel permissions for %s', channel_id)
+            return False
+
+        self.lockdown_state['channel_overwrites'].pop(str(channel_id), None)
+        self.lockdown_state['locked_channel_ids'] = [cid for cid in self.lockdown_state.get('locked_channel_ids', []) if cid != channel_id]
+        if not self.lockdown_state['locked_channel_ids']:
+            self.lockdown_state['active'] = False
+        self._save_lockdown_state()
+        return True
 
     async def _create_locked_ticket_from_modal(self, interaction: discord.Interaction, title: str, description: str):
         guild = interaction.guild
@@ -456,7 +594,9 @@ class Bot(commands.Bot):
         if guild is None or not isinstance(member, discord.Member):
             return await interaction.response.send_message('⚠️ Tickets can only be created inside a server.', ephemeral=True)
 
-        panel_channel = self.get_channel(TICKET_CHANNEL_ID) if TICKET_CHANNEL_ID else interaction.channel
+        panel_channel = interaction.channel
+        if panel_channel is None and TICKET_CHANNEL_ID:
+            panel_channel = self.get_channel(TICKET_CHANNEL_ID)
         if panel_channel is None or not isinstance(panel_channel, discord.TextChannel):
             return await interaction.response.send_message('⚠️ Ticket channel is not configured correctly.', ephemeral=True)
 
@@ -553,6 +693,14 @@ class Bot(commands.Bot):
             return perms.manage_messages
         if command_name == 'ticketpanel':
             return perms.manage_messages
+        if command_name == 'lockall':
+            return perms.manage_channels
+        if command_name == 'editlockmsg':
+            return perms.manage_channels
+        if command_name == 'unlock':
+            return perms.manage_channels
+        if command_name == 'unlockall':
+            return perms.manage_channels
         return False
 
     async def _has_command_access(self, ctx, command_name: str) -> bool:
@@ -943,15 +1091,217 @@ class Bot(commands.Bot):
         embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
         embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
         embed.add_field(name=f'{PREFIX}ticketpanel', value='Post the ticket panel with a Create Ticket button (staff only).', inline=False)
+        embed.add_field(name=f'{PREFIX}lockall [message]', value='Lock all channels to lockdown role and create/update a temporary status channel.', inline=False)
+        embed.add_field(name=f'{PREFIX}editlockmsg <message>', value='Edit the lockdown status message in the temporary channel.', inline=False)
+        embed.add_field(name=f'{PREFIX}unlock [channel_id]', value='Unlock one channel (defaults to current channel).', inline=False)
+        embed.add_field(name=f'{PREFIX}unlockall', value='Unlock all locked channels and delete the temporary status channel.', inline=False)
         embed.add_field(name='Ticket Buttons', value='Staff can use Open Ticket and Close Ticket buttons inside each ticket channel.', inline=False)
         await ctx.send(embed=embed)
+
+    async def lockall(self, ctx, *, message: str = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        lock_role = guild.get_role(LOCKDOWN_ROLE_ID)
+        if lock_role is None:
+            return await ctx.send(f'⚠️ Lockdown role not found: {LOCKDOWN_ROLE_ID}')
+
+        info_text = (message or '').strip() or '🔒 This server is temporarily locked down. Please wait while staff resolve an ongoing issue.'
+
+        temp_channel = None
+        temp_channel_id = self.lockdown_state.get('temp_channel_id')
+        if temp_channel_id:
+            temp_channel = guild.get_channel(int(temp_channel_id))
+
+        if temp_channel is None:
+            temp_overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False, read_message_history=True),
+                lock_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
+            }
+            try:
+                temp_channel = await guild.create_text_channel(
+                    name='server-status',
+                    overwrites=temp_overwrites,
+                    reason=f'Lockdown initiated by {ctx.author}',
+                )
+            except Exception:
+                log.exception('Failed to create temporary lockdown channel')
+                return await ctx.send('⚠️ Failed to create the temporary lockdown channel.')
+
+        locked_ids = set(self.lockdown_state.get('locked_channel_ids', []))
+        channel_overwrites = self.lockdown_state.get('channel_overwrites', {})
+        changed = 0
+
+        for channel in guild.channels:
+            if channel.id == temp_channel.id:
+                continue
+
+            if channel.id in locked_ids:
+                continue
+
+            previous_everyone = channel.overwrites_for(guild.default_role)
+            previous_role = channel.overwrites_for(lock_role)
+            channel_overwrites[str(channel.id)] = {
+                'everyone': self._serialize_overwrite(previous_everyone),
+                'role': self._serialize_overwrite(previous_role),
+            }
+
+            try:
+                await channel.set_permissions(guild.default_role, view_channel=False, reason=f'Lockdown initiated by {ctx.author}')
+                await channel.set_permissions(lock_role, view_channel=True, reason=f'Lockdown initiated by {ctx.author}')
+            except Exception:
+                log.exception('Failed to lock channel %s', channel.id)
+                channel_overwrites.pop(str(channel.id), None)
+                continue
+
+            locked_ids.add(channel.id)
+            changed += 1
+
+        status_embed = discord.Embed(
+            title='🔒 Temporary Server Lockdown',
+            description=info_text,
+            color=discord.Color.dark_red(),
+            timestamp=datetime.utcnow(),
+        )
+        status_embed.add_field(name='Access', value=f'Only <@&{LOCKDOWN_ROLE_ID}> can access most channels right now.', inline=False)
+        status_embed.set_footer(text=f'Actioned by {ctx.author}')
+
+        info_message_id = self.lockdown_state.get('info_message_id')
+        if info_message_id:
+            try:
+                old_msg = await temp_channel.fetch_message(int(info_message_id))
+                await old_msg.edit(embed=status_embed)
+                status_msg = old_msg
+            except Exception:
+                status_msg = await temp_channel.send(embed=status_embed)
+        else:
+            status_msg = await temp_channel.send(embed=status_embed)
+
+        self.lockdown_state['active'] = True
+        self.lockdown_state['temp_channel_id'] = temp_channel.id
+        self.lockdown_state['info_message_id'] = status_msg.id
+        self.lockdown_state['info_text'] = info_text
+        self.lockdown_state['locked_channel_ids'] = sorted(locked_ids)
+        self.lockdown_state['channel_overwrites'] = channel_overwrites
+        self._save_lockdown_state()
+
+        self._add_case('lockdown_all', guild.name, ctx.author, f'Locked {changed} channels', {'temp_channel_id': temp_channel.id})
+        await ctx.send(f'🔒 Lockdown active. Updated {changed} channel(s). Status channel: {temp_channel.mention}')
+
+    async def editlockmsg(self, ctx, *, message: str):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        temp_channel_id = self.lockdown_state.get('temp_channel_id')
+        info_message_id = self.lockdown_state.get('info_message_id')
+        if not temp_channel_id:
+            return await ctx.send('⚠️ No lockdown status channel is currently tracked.')
+
+        temp_channel = guild.get_channel(int(temp_channel_id))
+        if temp_channel is None or not isinstance(temp_channel, discord.TextChannel):
+            return await ctx.send('⚠️ The lockdown status channel no longer exists.')
+
+        text = message.strip()
+        if not text:
+            return await ctx.send('⚠️ Provide a non-empty message.')
+
+        embed = discord.Embed(
+            title='🔒 Temporary Server Lockdown',
+            description=text,
+            color=discord.Color.dark_red(),
+            timestamp=datetime.utcnow(),
+        )
+        embed.add_field(name='Access', value=f'Only <@&{LOCKDOWN_ROLE_ID}> can access most channels right now.', inline=False)
+        embed.set_footer(text=f'Updated by {ctx.author}')
+
+        try:
+            if info_message_id:
+                status_msg = await temp_channel.fetch_message(int(info_message_id))
+                await status_msg.edit(embed=embed)
+            else:
+                status_msg = await temp_channel.send(embed=embed)
+        except Exception:
+            log.exception('Failed to update lockdown message')
+            return await ctx.send('⚠️ Failed to edit the lockdown message.')
+
+        self.lockdown_state['info_message_id'] = status_msg.id
+        self.lockdown_state['info_text'] = text
+        self._save_lockdown_state()
+        await ctx.send('✅ Lockdown status message updated.')
+
+    async def unlock(self, ctx, channel_id: int = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        lock_role = guild.get_role(LOCKDOWN_ROLE_ID)
+        if lock_role is None:
+            return await ctx.send(f'⚠️ Lockdown role not found: {LOCKDOWN_ROLE_ID}')
+
+        target_channel = ctx.channel if channel_id is None else guild.get_channel(channel_id)
+        if target_channel is None:
+            return await ctx.send('⚠️ Channel not found.')
+
+        if self.lockdown_state.get('temp_channel_id') == target_channel.id:
+            return await ctx.send('⚠️ Use unlockall to remove the temporary status channel.')
+
+        ok = await self._restore_channel_from_lockdown(guild, target_channel.id, lock_role)
+        if not ok:
+            return await ctx.send('⚠️ Failed to unlock that channel or channel was not tracked as locked.')
+
+        self._add_case('unlock_single', str(target_channel), ctx.author, 'Unlocked single channel', {'channel_id': target_channel.id})
+        await ctx.send(f'🔓 Unlocked channel: {target_channel.mention}')
+
+    async def unlockall(self, ctx):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        lock_role = guild.get_role(LOCKDOWN_ROLE_ID)
+        if lock_role is None:
+            return await ctx.send(f'⚠️ Lockdown role not found: {LOCKDOWN_ROLE_ID}')
+
+        locked_ids = list(self.lockdown_state.get('locked_channel_ids', []))
+        restored = 0
+        for channel_id in locked_ids:
+            if await self._restore_channel_from_lockdown(guild, int(channel_id), lock_role):
+                restored += 1
+
+        temp_channel_id = self.lockdown_state.get('temp_channel_id')
+        temp_channel = guild.get_channel(int(temp_channel_id)) if temp_channel_id else None
+
+        self.lockdown_state['active'] = False
+        self.lockdown_state['locked_channel_ids'] = []
+        self.lockdown_state['channel_overwrites'] = {}
+        self.lockdown_state['info_message_id'] = None
+        self.lockdown_state['info_text'] = ''
+
+        deleted_temp = False
+        if temp_channel is not None:
+            try:
+                await temp_channel.delete(reason=f'Lockdown ended by {ctx.author}')
+                deleted_temp = True
+            except Exception:
+                log.exception('Failed to delete temporary lockdown channel')
+
+        self.lockdown_state['temp_channel_id'] = None
+        self._save_lockdown_state()
+
+        self._add_case('unlock_all', guild.name, ctx.author, f'Unlocked {restored} channels', {'deleted_temp_channel': deleted_temp})
+        if deleted_temp:
+            await ctx.send(f'🔓 Unlock complete. Restored {restored} channel(s) and removed the temporary status channel.')
+        else:
+            await ctx.send(f'🔓 Unlock complete. Restored {restored} channel(s). Temporary status channel was not deleted.')
 
     async def ticketpanel(self, ctx):
         if self.ticket_panel_view is None:
             self.ticket_panel_view = TicketPanelView(self)
             self.add_view(self.ticket_panel_view)
 
-        panel_channel = self.get_channel(TICKET_CHANNEL_ID) if TICKET_CHANNEL_ID else ctx.channel
+        panel_channel = ctx.channel
         if panel_channel is None or not isinstance(panel_channel, discord.TextChannel):
             return await ctx.send('⚠️ Ticket channel is not configured correctly.')
 
@@ -963,8 +1313,6 @@ class Bot(commands.Bot):
         )
         embed.add_field(name='How it works', value='1) Press the button\n2) Fill in title and description\n3) Wait for staff to open the ticket', inline=False)
         await panel_channel.send(embed=embed, view=self.ticket_panel_view)
-        if panel_channel.id != ctx.channel.id:
-            await ctx.send(f'✅ Ticket panel posted in {panel_channel.mention}.')
 
     async def cmdhelp(self, ctx):
         await self.cmd_help(ctx)
@@ -1211,8 +1559,8 @@ class Bot(commands.Bot):
 
 
 def main():
-    if not TOKEN or TOKEN == 'PASTE_YOUR_BOT_TOKEN_HERE':
-        log.error('Set TOKEN in bot.py before running the bot')
+    if not TOKEN:
+        log.error('Set BOT_TOKEN environment variable before running the bot')
         return
     bot = Bot()
     bot.run(TOKEN)
