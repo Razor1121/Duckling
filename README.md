@@ -39,3 +39,20 @@ Anti-Phish Discord Bot helps protect and manage a Discord server by combining au
 ### Important behavior notes
 - The phishing detector is heuristic-based and may occasionally produce false positives or false negatives.
 - Link and token safety checks focus on message text content.
+
+## Setup and configuration
+1. Set your bot token and optional prefix before running the bot:
+   - `BOT_TOKEN` — your Discord bot token
+   - `BOT_PREFIX` — optional command prefix, default is `=`
+2. Invite the bot to your server with permissions for:
+   - Manage roles, manage channels, moderate members, manage messages
+   - Send messages, read message history, embed links
+3. Configure server-specific settings using bot commands:
+   - `=setlogchannel #channel` — select where logs are sent
+   - `=setmoderatorrole @role` — role that can use most moderation commands
+   - `=setlockdownrole @role` — role that can access channels during lockdown
+   - `=setquarantinerole @role` — role assigned to users auto-quarantined by the bot
+   - `=setticketstaffrole @role` — staff role for ticket panel actions
+4. Post the ticket panel with `=ticketpanel` in a staff channel.
+5. Use `=lockall`, `=unlock`, and `=unlockall` for server lockdown control.
+6. Use `=help` in Discord to view supported commands and syntax.

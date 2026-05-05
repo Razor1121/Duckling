@@ -32,6 +32,7 @@ CUSTOM_PHISH_RE = None
 # Example: 'ban': [111111111111111111, 222222222222222222]
 COMMAND_ROLE_ACCESS = {
     'ban': [],
+    'unban': [],
     'kick': [],
     'timeout': [],
     'delete': [],
@@ -40,6 +41,10 @@ COMMAND_ROLE_ACCESS = {
     'lastphish': [],
     'ticketpanel': [],
     'setlogchannel': [],
+    'setmoderatorrole': [],
+    'setlockdownrole': [],
+    'setquarantinerole': [],
+    'setticketstaffrole': [],
     'lockall': [],
     'editlockmsg': [],
     'unlock': [],
@@ -359,16 +364,16 @@ class Bot(commands.Bot):
         self.trivia_scores = {}
         self.custom_link_patterns = []
         self.settings = {
-            'log_channel_id': LOG_CHANNEL_ID,
+            'guilds': {},
+            'defaults': {
+                'log_channel_id': LOG_CHANNEL_ID,
+                'moderator_role_id': 0,
+                'lockdown_role_id': LOCKDOWN_ROLE_ID,
+                'ticket_staff_role_id': TICKET_STAFF_ROLE_ID,
+                'quarantine_role_id': QUARANTINE_ROLE_ID,
+            },
         }
-        self.lockdown_state = {
-            'active': False,
-            'temp_channel_id': None,
-            'info_message_id': None,
-            'info_text': '',
-            'locked_channel_ids': [],
-            'channel_overwrites': {},
-        }
+        self.lockdown_state = {}
         self.ticket_panel_view = None
         self.ticket_open_view = None
         self._load_cases()
@@ -398,6 +403,9 @@ class Bot(commands.Bot):
 
         async def ban_callback(ctx, member: discord.Member, *, reason='No reason'):
             await self.ban(ctx, member, reason=reason)
+
+        async def unban_callback(ctx, user_id: int, *, reason='No reason'):
+            await self.unban(ctx, user_id, reason=reason)
 
         async def kick_callback(ctx, member: discord.Member, *, reason='No reason'):
             await self.kick(ctx, member, reason=reason)
@@ -441,6 +449,18 @@ class Bot(commands.Bot):
         async def setlogchannel_callback(ctx, channel: discord.TextChannel = None):
             await self.setlogchannel(ctx, channel=channel)
 
+        async def setmoderatorrole_callback(ctx, role: discord.Role = None):
+            await self.setmoderatorrole(ctx, role=role)
+
+        async def setlockdownrole_callback(ctx, role: discord.Role = None):
+            await self.setlockdownrole(ctx, role=role)
+
+        async def setquarantinerole_callback(ctx, role: discord.Role = None):
+            await self.setquarantinerole(ctx, role=role)
+
+        async def setticketstaffrole_callback(ctx, role: discord.Role = None):
+            await self.setticketstaffrole(ctx, role=role)
+
         async def lockall_callback(ctx, *, message: str = None):
             await self.lockall(ctx, message=message)
 
@@ -461,6 +481,9 @@ class Bot(commands.Bot):
 
         ban_cmd = commands.Command(ban_callback, name='ban')
         ban_cmd.add_check(self._make_command_access_check('ban'))
+
+        unban_cmd = commands.Command(unban_callback, name='unban')
+        unban_cmd.add_check(self._make_command_access_check('unban'))
 
         kick_cmd = commands.Command(kick_callback, name='kick')
         kick_cmd.add_check(self._make_command_access_check('kick'))
@@ -489,6 +512,18 @@ class Bot(commands.Bot):
         setlogchannel_cmd = commands.Command(setlogchannel_callback, name='setlogchannel', aliases=['logchannel'])
         setlogchannel_cmd.add_check(self._make_command_access_check('setlogchannel'))
 
+        setmoderatorrole_cmd = commands.Command(setmoderatorrole_callback, name='setmoderatorrole', aliases=['modrole'])
+        setmoderatorrole_cmd.add_check(self._make_command_access_check('setmoderatorrole'))
+
+        setlockdownrole_cmd = commands.Command(setlockdownrole_callback, name='setlockdownrole', aliases=['lockrole'])
+        setlockdownrole_cmd.add_check(self._make_command_access_check('setlockdownrole'))
+
+        setquarantinerole_cmd = commands.Command(setquarantinerole_callback, name='setquarantinerole', aliases=['quarantinerole'])
+        setquarantinerole_cmd.add_check(self._make_command_access_check('setquarantinerole'))
+
+        setticketstaffrole_cmd = commands.Command(setticketstaffrole_callback, name='setticketstaffrole', aliases=['ticketstaff'])
+        setticketstaffrole_cmd.add_check(self._make_command_access_check('setticketstaffrole'))
+
         lockall_cmd = commands.Command(lockall_callback, name='lockall')
         lockall_cmd.add_check(self._make_command_access_check('lockall'))
 
@@ -505,10 +540,11 @@ class Bot(commands.Bot):
         lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
 
         for command in [
-            check_cmd, help_cmd, ping_cmd, ban_cmd, kick_cmd, timeout_cmd,
+            check_cmd, help_cmd, ping_cmd, ban_cmd, unban_cmd, kick_cmd, timeout_cmd,
             delete_cmd, cases_cmd, reply_cmd, lastphish_cmd, trivia_cmd, eightball_cmd,
             coinflip_cmd, roll_cmd, rps_cmd, add_link_cmd, ticketpanel_cmd,
-            setlogchannel_cmd,
+            setlogchannel_cmd, setmoderatorrole_cmd, setlockdownrole_cmd,
+            setquarantinerole_cmd, setticketstaffrole_cmd,
             lockall_cmd, editlockmsg_cmd, unlock_cmd, unlockall_cmd
         ]:
             self.add_command(command)
@@ -526,11 +562,51 @@ class Bot(commands.Bot):
         if not isinstance(data, dict):
             return
 
-        log_channel_id = data.get('log_channel_id', LOG_CHANNEL_ID)
+        guilds = data.get('guilds')
+        if isinstance(guilds, dict):
+            self.settings['guilds'] = guilds
+        else:
+            self.settings['guilds'] = {}
+
+        defaults = data.get('defaults', {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+
         try:
-            self.settings['log_channel_id'] = int(log_channel_id)
+            self.settings['defaults']['log_channel_id'] = int(defaults.get('log_channel_id', LOG_CHANNEL_ID) or LOG_CHANNEL_ID)
         except Exception:
-            self.settings['log_channel_id'] = LOG_CHANNEL_ID
+            self.settings['defaults']['log_channel_id'] = LOG_CHANNEL_ID
+
+        try:
+            self.settings['defaults']['moderator_role_id'] = int(defaults.get('moderator_role_id', 0) or 0)
+        except Exception:
+            self.settings['defaults']['moderator_role_id'] = 0
+
+        try:
+            self.settings['defaults']['lockdown_role_id'] = int(defaults.get('lockdown_role_id', LOCKDOWN_ROLE_ID) or LOCKDOWN_ROLE_ID)
+        except Exception:
+            self.settings['defaults']['lockdown_role_id'] = LOCKDOWN_ROLE_ID
+
+        try:
+            self.settings['defaults']['ticket_staff_role_id'] = int(defaults.get('ticket_staff_role_id', TICKET_STAFF_ROLE_ID) or TICKET_STAFF_ROLE_ID)
+        except Exception:
+            self.settings['defaults']['ticket_staff_role_id'] = TICKET_STAFF_ROLE_ID
+
+        try:
+            self.settings['defaults']['quarantine_role_id'] = int(defaults.get('quarantine_role_id', QUARANTINE_ROLE_ID) or QUARANTINE_ROLE_ID)
+        except Exception:
+            self.settings['defaults']['quarantine_role_id'] = QUARANTINE_ROLE_ID
+
+        # Backward compatibility for legacy flat settings
+        if 'guilds' not in data:
+            try:
+                self.settings['defaults']['log_channel_id'] = int(data.get('log_channel_id', self.settings['defaults']['log_channel_id']) or self.settings['defaults']['log_channel_id'])
+            except Exception:
+                pass
+            try:
+                self.settings['defaults']['moderator_role_id'] = int(data.get('moderator_role_id', self.settings['defaults']['moderator_role_id']) or self.settings['defaults']['moderator_role_id'])
+            except Exception:
+                pass
 
     def _save_settings(self):
         try:
@@ -539,14 +615,49 @@ class Bot(commands.Bot):
         except Exception:
             log.exception('Failed to save bot settings')
 
-    def _get_log_channel_id(self) -> int:
+    def _get_guild_settings(self, guild: discord.Guild):
+        if guild is None:
+            return {}
+        guild_id = str(guild.id)
+        guilds = self.settings.setdefault('guilds', {})
+        if guild_id not in guilds or not isinstance(guilds[guild_id], dict):
+            guilds[guild_id] = {}
+        return guilds[guild_id]
+
+    def _get_guild_setting(self, guild: discord.Guild, key: str, default=0):
+        if guild is None:
+            return default
+        guild_settings = self._get_guild_settings(guild)
+        value = guild_settings.get(key, self.settings.get('defaults', {}).get(key, default))
         try:
-            return int(self.settings.get('log_channel_id', LOG_CHANNEL_ID) or 0)
+            return int(value) if value is not None else default
         except Exception:
-            return 0
+            return default
+
+    def _set_guild_setting(self, guild: discord.Guild, key: str, value):
+        if guild is None:
+            return
+        guild_settings = self._get_guild_settings(guild)
+        guild_settings[key] = int(value) if value is not None else 0
+        self._save_settings()
+
+    def _get_log_channel_id(self, guild: discord.Guild = None) -> int:
+        return self._get_guild_setting(guild, 'log_channel_id', LOG_CHANNEL_ID)
+
+    def _get_moderator_role_id(self, guild: discord.Guild = None) -> int:
+        return self._get_guild_setting(guild, 'moderator_role_id', 0)
+
+    def _get_lockdown_role_id(self, guild: discord.Guild = None) -> int:
+        return self._get_guild_setting(guild, 'lockdown_role_id', LOCKDOWN_ROLE_ID)
+
+    def _get_ticket_staff_role_id(self, guild: discord.Guild = None) -> int:
+        return self._get_guild_setting(guild, 'ticket_staff_role_id', TICKET_STAFF_ROLE_ID)
+
+    def _get_quarantine_role_id(self, guild: discord.Guild = None) -> int:
+        return self._get_guild_setting(guild, 'quarantine_role_id', QUARANTINE_ROLE_ID)
 
     def _resolve_log_channel(self, guild: discord.Guild = None):
-        channel_id = self._get_log_channel_id()
+        channel_id = self._get_log_channel_id(guild)
         if channel_id <= 0:
             return None
         channel = self.get_channel(channel_id)
@@ -646,31 +757,45 @@ class Bot(commands.Bot):
         if not isinstance(data, dict):
             return
 
-        self.lockdown_state['active'] = bool(data.get('active', False))
-        self.lockdown_state['temp_channel_id'] = data.get('temp_channel_id')
-        self.lockdown_state['info_message_id'] = data.get('info_message_id')
-        self.lockdown_state['info_text'] = str(data.get('info_text', ''))
+        if any(key in data for key in ('active', 'temp_channel_id', 'info_message_id', 'locked_channel_ids', 'channel_overwrites')):
+            # Legacy format: store as default state under a placeholder key
+            self.lockdown_state = {'default': data}
+            return
 
-        ids = data.get('locked_channel_ids', [])
-        if isinstance(ids, list):
-            parsed_ids = []
-            for value in ids:
-                try:
-                    parsed_ids.append(int(value))
-                except Exception:
-                    continue
-            self.lockdown_state['locked_channel_ids'] = parsed_ids
+        self.lockdown_state = data
 
-        overwrites = data.get('channel_overwrites', {})
-        if isinstance(overwrites, dict):
-            self.lockdown_state['channel_overwrites'] = overwrites
+    def _get_lockdown_state(self, guild: discord.Guild):
+        if guild is None:
+            return {
+                'active': False,
+                'temp_channel_id': None,
+                'info_message_id': None,
+                'info_text': '',
+                'locked_channel_ids': [],
+                'channel_overwrites': {},
+            }
+
+        guild_id = str(guild.id)
+        state = self.lockdown_state.setdefault(guild_id, {})
+        if not isinstance(state, dict):
+            state = {}
+            self.lockdown_state[guild_id] = state
+
+        state.setdefault('active', False)
+        state.setdefault('temp_channel_id', None)
+        state.setdefault('info_message_id', None)
+        state.setdefault('info_text', '')
+        state.setdefault('locked_channel_ids', [])
+        state.setdefault('channel_overwrites', {})
+        return state
 
     async def _restore_channel_from_lockdown(self, guild: discord.Guild, channel_id: int, lock_role: discord.Role):
         channel = guild.get_channel(channel_id)
         if channel is None:
             return False
 
-        before = self.lockdown_state.get('channel_overwrites', {}).get(str(channel_id), {})
+        state = self._get_lockdown_state(guild)
+        before = state.get('channel_overwrites', {}).get(str(channel_id), {})
         everyone_data = before.get('everyone') if isinstance(before, dict) else None
         role_data = before.get('role') if isinstance(before, dict) else None
 
@@ -691,10 +816,11 @@ class Bot(commands.Bot):
             log.exception('Failed to restore channel permissions for %s', channel_id)
             return False
 
-        self.lockdown_state['channel_overwrites'].pop(str(channel_id), None)
-        self.lockdown_state['locked_channel_ids'] = [cid for cid in self.lockdown_state.get('locked_channel_ids', []) if cid != channel_id]
-        if not self.lockdown_state['locked_channel_ids']:
-            self.lockdown_state['active'] = False
+        state['channel_overwrites'].pop(str(channel_id), None)
+        state['locked_channel_ids'] = [cid for cid in state.get('locked_channel_ids', []) if cid != channel_id]
+        if not state['locked_channel_ids']:
+            state['active'] = False
+        self.lockdown_state[str(guild.id)] = state
         self._save_lockdown_state()
         return True
 
@@ -725,7 +851,8 @@ class Bot(commands.Bot):
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
         }
 
-        staff_role = guild.get_role(TICKET_STAFF_ROLE_ID)
+        staff_role_id = self._get_ticket_staff_role_id(guild)
+        staff_role = guild.get_role(staff_role_id) if staff_role_id > 0 else None
         if staff_role is not None:
             overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
@@ -751,7 +878,7 @@ class Bot(commands.Bot):
         embed.add_field(name='Title', value=title[:1024], inline=False)
         embed.add_field(name='Description', value=description[:1024], inline=False)
 
-        mention = f'<@&{TICKET_STAFF_ROLE_ID}>' if staff_role is not None else '@here'
+        mention = f'<@&{staff_role.id}>' if staff_role is not None else '@here'
         await ticket_channel.send(content=f'{mention} New ticket created.', embed=embed, view=TicketOpenView(self))
 
         self._add_case('ticket_created', member, member, title, {'description': description, 'channel_id': ticket_channel.id})
@@ -788,6 +915,8 @@ class Bot(commands.Bot):
     def _has_fallback_permission(self, member: discord.Member, command_name: str) -> bool:
         perms = member.guild_permissions
         if command_name == 'ban':
+            return perms.ban_members
+        if command_name == 'unban':
             return perms.ban_members
         if command_name == 'kick':
             return perms.kick_members
@@ -826,6 +955,18 @@ class Bot(commands.Bot):
         role_ids = self._get_configured_role_ids(command_name)
         if any(role.id in role_ids for role in ctx.author.roles):
             return True
+
+        # Check moderator role for moderation commands
+        moderator_role_id = self._get_moderator_role_id(ctx.guild)
+        if moderator_role_id > 0:
+            moderator_commands = {
+                'ban', 'unban', 'kick', 'timeout', 'delete', 'reply', 'cases', 'lastphish',
+                'ticketpanel', 'lockall', 'editlockmsg', 'unlock', 'unlockall',
+                'setlogchannel', 'setmoderatorrole', 'setlockdownrole',
+                'setquarantinerole', 'setticketstaffrole'
+            }
+            if command_name in moderator_commands and any(role.id == moderator_role_id for role in ctx.author.roles):
+                return True
 
         return self._has_fallback_permission(ctx.author, command_name)
 
@@ -998,9 +1139,14 @@ class Bot(commands.Bot):
         if not message.guild or not isinstance(message.author, discord.Member):
             return False
 
-        role = message.guild.get_role(QUARANTINE_ROLE_ID)
+        role_id = self._get_quarantine_role_id(message.guild)
+        if role_id <= 0:
+            log.warning('Quarantine role is not configured for guild %s', message.guild.id)
+            return False
+
+        role = message.guild.get_role(role_id)
         if role is None:
-            log.warning('Quarantine role not found: %s', QUARANTINE_ROLE_ID)
+            log.warning('Quarantine role not found: %s for guild %s', role_id, message.guild.id)
             return False
 
         if role in message.author.roles:
@@ -1014,7 +1160,7 @@ class Bot(commands.Bot):
 
         self._add_case('quarantine', message.author, self.user, f'Auto quarantine: {trigger}', {'evidence': evidence})
 
-        log_channel = self.get_channel(LOG_CHANNEL_ID) if LOG_CHANNEL_ID else message.channel
+        log_channel = self._resolve_log_channel(message.guild) or message.channel
         if log_channel is None:
             log_channel = message.channel
 
@@ -1186,6 +1332,7 @@ class Bot(commands.Bot):
         embed.add_field(name=f'{PREFIX}ping', value='Quick command test (bot should reply Pong).', inline=False)
         embed.add_field(name=f'{PREFIX}check <text/link>', value='Owner-only manual check for suspicious links.', inline=False)
         embed.add_field(name=f'{PREFIX}ban <member> [reason]', value='Ban a member.', inline=False)
+        embed.add_field(name=f'{PREFIX}unban <user_id> [reason]', value='Unban a user by their ID.', inline=False)
         embed.add_field(name=f'{PREFIX}kick <member> [reason]', value='Kick a member.', inline=False)
         embed.add_field(name=f'{PREFIX}timeout <member> <duration> [reason]', value='Timeout format: 1d / 2h / 30m / 60s.', inline=False)
         embed.add_field(name=f'{PREFIX}clear [amount]', value='Delete 1-100 messages. Alias: delete.', inline=False)
@@ -1196,6 +1343,10 @@ class Bot(commands.Bot):
         embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
         embed.add_field(name=f'{PREFIX}ticketpanel', value='Post the ticket panel with a Create Ticket button (staff only).', inline=False)
         embed.add_field(name=f'{PREFIX}setlogchannel [#channel]', value='Set the channel used for embed logs (cases and phishing/security events).', inline=False)
+        embed.add_field(name=f'{PREFIX}setmoderatorrole [@role]', value='Set a moderator role that can use most moderation commands. Leave empty to clear.', inline=False)
+        embed.add_field(name=f'{PREFIX}setlockdownrole [@role]', value='Set the role that lockdown commands will allow access to. Leave empty to clear.', inline=False)
+        embed.add_field(name=f'{PREFIX}setquarantinerole [@role]', value='Set the role used for auto-quarantine assignments. Leave empty to clear.', inline=False)
+        embed.add_field(name=f'{PREFIX}setticketstaffrole [@role]', value='Set the ticket staff role used for ticket panel access. Leave empty to clear.', inline=False)
         embed.add_field(name=f'{PREFIX}lockall [message]', value='Lock all channels to lockdown role and create/update a temporary status channel.', inline=False)
         embed.add_field(name=f'{PREFIX}editlockmsg <message>', value='Edit the lockdown status message in the temporary channel.', inline=False)
         embed.add_field(name=f'{PREFIX}unlock [channel_id]', value='Unlock one channel (defaults to current channel).', inline=False)
@@ -1212,23 +1363,75 @@ class Bot(commands.Bot):
         if not isinstance(target, discord.TextChannel):
             return await ctx.send('⚠️ Please choose a text channel.')
 
-        self.settings['log_channel_id'] = target.id
-        self._save_settings()
+        self._set_guild_setting(guild, 'log_channel_id', target.id)
         await ctx.send(f'✅ Log channel set to {target.mention}. New log events will be sent there as embeds.')
+
+    async def setmoderatorrole(self, ctx, role: discord.Role = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        if role is None:
+            self._set_guild_setting(guild, 'moderator_role_id', 0)
+            await ctx.send('✅ Moderator role cleared. Only users with Discord moderation permissions or administrator role can use moderation commands.')
+        else:
+            self._set_guild_setting(guild, 'moderator_role_id', role.id)
+            await ctx.send(f'✅ Moderator role set to {role.mention}. Users with this role can now use most moderation commands.')
+
+    async def setlockdownrole(self, ctx, role: discord.Role = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        if role is None:
+            self._set_guild_setting(guild, 'lockdown_role_id', 0)
+            await ctx.send('✅ Lockdown role cleared. Lockdown commands will no longer work until a role is configured.')
+        else:
+            self._set_guild_setting(guild, 'lockdown_role_id', role.id)
+            await ctx.send(f'✅ Lockdown role set to {role.mention}. Lockdown commands will use this role.')
+
+    async def setquarantinerole(self, ctx, role: discord.Role = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        if role is None:
+            self._set_guild_setting(guild, 'quarantine_role_id', 0)
+            await ctx.send('✅ Quarantine role cleared. Auto-quarantine will be disabled until a role is configured.')
+        else:
+            self._set_guild_setting(guild, 'quarantine_role_id', role.id)
+            await ctx.send(f'✅ Quarantine role set to {role.mention}. Auto-quarantine will use this role.')
+
+    async def setticketstaffrole(self, ctx, role: discord.Role = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        if role is None:
+            self._set_guild_setting(guild, 'ticket_staff_role_id', 0)
+            await ctx.send('✅ Ticket staff role cleared. Ticket panels will no longer auto-grant staff access unless a role is configured.')
+        else:
+            self._set_guild_setting(guild, 'ticket_staff_role_id', role.id)
+            await ctx.send(f'✅ Ticket staff role set to {role.mention}. Tickets will grant this role access.')
 
     async def lockall(self, ctx, *, message: str = None):
         guild = ctx.guild
         if guild is None:
             return await ctx.send('⚠️ This command can only be used in a server.')
 
-        lock_role = guild.get_role(LOCKDOWN_ROLE_ID)
+        lock_role_id = self._get_lockdown_role_id(guild)
+        if lock_role_id <= 0:
+            return await ctx.send('⚠️ Lockdown role is not configured for this server.')
+
+        lock_role = guild.get_role(lock_role_id)
         if lock_role is None:
-            return await ctx.send(f'⚠️ Lockdown role not found: {LOCKDOWN_ROLE_ID}')
+            return await ctx.send(f'⚠️ Lockdown role not found: {lock_role_id}')
 
         info_text = (message or '').strip() or '🔒 This server is temporarily locked down. Please wait while staff resolve an ongoing issue.'
 
+        guild_state = self._get_lockdown_state(guild)
         temp_channel = None
-        temp_channel_id = self.lockdown_state.get('temp_channel_id')
+        temp_channel_id = guild_state.get('temp_channel_id')
         if temp_channel_id:
             temp_channel = guild.get_channel(int(temp_channel_id))
 
@@ -1248,8 +1451,8 @@ class Bot(commands.Bot):
                 log.exception('Failed to create temporary lockdown channel')
                 return await ctx.send('⚠️ Failed to create the temporary lockdown channel.')
 
-        locked_ids = set(self.lockdown_state.get('locked_channel_ids', []))
-        channel_overwrites = self.lockdown_state.get('channel_overwrites', {})
+        locked_ids = set(guild_state.get('locked_channel_ids', []))
+        channel_overwrites = guild_state.get('channel_overwrites', {})
         changed = 0
         skipped_onboarding = []
 
@@ -1288,10 +1491,10 @@ class Bot(commands.Bot):
             color=discord.Color.dark_red(),
             timestamp=datetime.utcnow(),
         )
-        status_embed.add_field(name='Access', value=f'Only <@&{LOCKDOWN_ROLE_ID}> can access most channels right now.', inline=False)
+        status_embed.add_field(name='Access', value=f'Only <@&{lock_role_id}> can access most channels right now.', inline=False)
         status_embed.set_footer(text=f'Actioned by {ctx.author}')
 
-        info_message_id = self.lockdown_state.get('info_message_id')
+        info_message_id = guild_state.get('info_message_id')
         if info_message_id:
             try:
                 old_msg = await temp_channel.fetch_message(int(info_message_id))
@@ -1302,12 +1505,13 @@ class Bot(commands.Bot):
         else:
             status_msg = await temp_channel.send(embed=status_embed)
 
-        self.lockdown_state['active'] = True
-        self.lockdown_state['temp_channel_id'] = temp_channel.id
-        self.lockdown_state['info_message_id'] = status_msg.id
-        self.lockdown_state['info_text'] = info_text
-        self.lockdown_state['locked_channel_ids'] = sorted(locked_ids)
-        self.lockdown_state['channel_overwrites'] = channel_overwrites
+        guild_state['active'] = True
+        guild_state['temp_channel_id'] = temp_channel.id
+        guild_state['info_message_id'] = status_msg.id
+        guild_state['info_text'] = info_text
+        guild_state['locked_channel_ids'] = sorted(locked_ids)
+        guild_state['channel_overwrites'] = channel_overwrites
+        self.lockdown_state[str(guild.id)] = guild_state
         self._save_lockdown_state()
 
         self._add_case('lockdown_all', guild.name, ctx.author, f'Locked {changed} channels', {'temp_channel_id': temp_channel.id})
@@ -1328,8 +1532,9 @@ class Bot(commands.Bot):
         if guild is None:
             return await ctx.send('⚠️ This command can only be used in a server.')
 
-        temp_channel_id = self.lockdown_state.get('temp_channel_id')
-        info_message_id = self.lockdown_state.get('info_message_id')
+        guild_state = self._get_lockdown_state(guild)
+        temp_channel_id = guild_state.get('temp_channel_id')
+        info_message_id = guild_state.get('info_message_id')
         if not temp_channel_id:
             return await ctx.send('⚠️ No lockdown status channel is currently tracked.')
 
@@ -1341,13 +1546,14 @@ class Bot(commands.Bot):
         if not text:
             return await ctx.send('⚠️ Provide a non-empty message.')
 
+        lock_role_id = self._get_lockdown_role_id(guild)
         embed = discord.Embed(
             title='🔒 Temporary Server Lockdown',
             description=text,
             color=discord.Color.dark_red(),
             timestamp=datetime.utcnow(),
         )
-        embed.add_field(name='Access', value=f'Only <@&{LOCKDOWN_ROLE_ID}> can access most channels right now.', inline=False)
+        embed.add_field(name='Access', value=f'Only <@&{lock_role_id}> can access most channels right now.', inline=False)
         embed.set_footer(text=f'Updated by {ctx.author}')
 
         try:
@@ -1360,8 +1566,9 @@ class Bot(commands.Bot):
             log.exception('Failed to update lockdown message')
             return await ctx.send('⚠️ Failed to edit the lockdown message.')
 
-        self.lockdown_state['info_message_id'] = status_msg.id
-        self.lockdown_state['info_text'] = text
+        guild_state['info_message_id'] = status_msg.id
+        guild_state['info_text'] = text
+        self.lockdown_state[str(guild.id)] = guild_state
         self._save_lockdown_state()
         await ctx.send('✅ Lockdown status message updated.')
 
@@ -1370,15 +1577,20 @@ class Bot(commands.Bot):
         if guild is None:
             return await ctx.send('⚠️ This command can only be used in a server.')
 
-        lock_role = guild.get_role(LOCKDOWN_ROLE_ID)
-        if lock_role is None:
-            return await ctx.send(f'⚠️ Lockdown role not found: {LOCKDOWN_ROLE_ID}')
+        lock_role_id = self._get_lockdown_role_id(guild)
+        if lock_role_id <= 0:
+            return await ctx.send('⚠️ Lockdown role is not configured for this server.')
 
+        lock_role = guild.get_role(lock_role_id)
+        if lock_role is None:
+            return await ctx.send(f'⚠️ Lockdown role not found: {lock_role_id}')
+
+        guild_state = self._get_lockdown_state(guild)
         target_channel = ctx.channel if channel_id is None else guild.get_channel(channel_id)
         if target_channel is None:
             return await ctx.send('⚠️ Channel not found.')
 
-        if self.lockdown_state.get('temp_channel_id') == target_channel.id:
+        if guild_state.get('temp_channel_id') == target_channel.id:
             return await ctx.send('⚠️ Use unlockall to remove the temporary status channel.')
 
         ok = await self._restore_channel_from_lockdown(guild, target_channel.id, lock_role)
@@ -1393,24 +1605,31 @@ class Bot(commands.Bot):
         if guild is None:
             return await ctx.send('⚠️ This command can only be used in a server.')
 
-        lock_role = guild.get_role(LOCKDOWN_ROLE_ID)
-        if lock_role is None:
-            return await ctx.send(f'⚠️ Lockdown role not found: {LOCKDOWN_ROLE_ID}')
+        lock_role_id = self._get_lockdown_role_id(guild)
+        if lock_role_id <= 0:
+            return await ctx.send('⚠️ Lockdown role is not configured for this server.')
 
-        locked_ids = list(self.lockdown_state.get('locked_channel_ids', []))
+        lock_role = guild.get_role(lock_role_id)
+        if lock_role is None:
+            return await ctx.send(f'⚠️ Lockdown role not found: {lock_role_id}')
+
+        guild_state = self._get_lockdown_state(guild)
+        locked_ids = list(guild_state.get('locked_channel_ids', []))
         restored = 0
         for channel_id in locked_ids:
             if await self._restore_channel_from_lockdown(guild, int(channel_id), lock_role):
                 restored += 1
 
-        temp_channel_id = self.lockdown_state.get('temp_channel_id')
+        temp_channel_id = guild_state.get('temp_channel_id')
         temp_channel = guild.get_channel(int(temp_channel_id)) if temp_channel_id else None
 
-        self.lockdown_state['active'] = False
-        self.lockdown_state['locked_channel_ids'] = []
-        self.lockdown_state['channel_overwrites'] = {}
-        self.lockdown_state['info_message_id'] = None
-        self.lockdown_state['info_text'] = ''
+        guild_state['active'] = False
+        guild_state['locked_channel_ids'] = []
+        guild_state['channel_overwrites'] = {}
+        guild_state['info_message_id'] = None
+        guild_state['info_text'] = ''
+        guild_state['temp_channel_id'] = None
+        self.lockdown_state[str(guild.id)] = guild_state
 
         deleted_temp = False
         if temp_channel is not None:
@@ -1420,7 +1639,6 @@ class Bot(commands.Bot):
             except Exception:
                 log.exception('Failed to delete temporary lockdown channel')
 
-        self.lockdown_state['temp_channel_id'] = None
         self._save_lockdown_state()
 
         self._add_case('unlock_all', guild.name, ctx.author, f'Unlocked {restored} channels', {'deleted_temp_channel': deleted_temp})
@@ -1457,6 +1675,26 @@ class Bot(commands.Bot):
         await ctx.guild.ban(member, reason=reason)
         self._add_case('ban', member, ctx.author, reason)
         await ctx.send(f'✅ {member} banned')
+
+    async def unban(self, ctx, user_id: int, *, reason='No reason'):
+        try:
+            user = await self.fetch_user(user_id)
+        except discord.NotFound:
+            return await ctx.send('⚠️ User not found.')
+        except discord.HTTPException:
+            return await ctx.send('⚠️ Failed to fetch user information.')
+
+        try:
+            await ctx.guild.unban(user, reason=reason)
+        except discord.NotFound:
+            return await ctx.send('⚠️ User is not banned.')
+        except discord.Forbidden:
+            return await ctx.send('⚠️ I do not have permission to unban users.')
+        except discord.HTTPException:
+            return await ctx.send('⚠️ Failed to unban user.')
+
+        self._add_case('unban', user, ctx.author, reason)
+        await ctx.send(f'✅ {user} unbanned')
 
     async def kick(self, ctx, member: discord.Member, *, reason='No reason'):
         await ctx.guild.kick(member, reason=reason)
