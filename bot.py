@@ -1,5 +1,4 @@
-import os, re, json, logging, random, html, asyncio
-from urllib import request
+import os, re, json, logging, asyncio
 from datetime import datetime, timedelta
 import discord
 from discord.ext import commands
@@ -13,9 +12,8 @@ def _env_int(name: str, default: int = 0) -> int:
     except Exception:
         return default
 
-
 TOKEN = os.getenv('BOT_TOKEN', '').strip()
-PREFIX = os.getenv('BOT_PREFIX', '=')
+PREFIX = '='
 LOG_CHANNEL_ID = _env_int('LOG_CHANNEL_ID', 0)
 TICKET_CHANNEL_ID = _env_int('TICKET_CHANNEL_ID', 0)
 TICKET_STAFF_ROLE_ID = _env_int('TICKET_STAFF_ROLE_ID', 0)
@@ -26,6 +24,8 @@ CUSTOM_LINK_PATTERNS_FILE = 'custom_link_patterns.json'
 LOCKDOWN_STATE_FILE = 'lockdown_state.json'
 BOT_SETTINGS_FILE = 'bot_settings.json'
 CUSTOM_PHISH_RE = None
+AUTO_TIMEOUT_NEW_ACCOUNT_DAYS = _env_int('AUTO_TIMEOUT_NEW_ACCOUNT_DAYS', 3)
+AUTO_TIMEOUT_DURATION_DAYS = _env_int('AUTO_TIMEOUT_DURATION_DAYS', 28)
 
 # Command role access (up to 8 role IDs per command).
 # Add role IDs to allow those roles to use the command through the bot.
@@ -38,15 +38,17 @@ COMMAND_ROLE_ACCESS = {
     'delete': [],
     'reply': [],
     'cases': [],
+    'verify': []
     'lastphish': [],
     'ticketpanel': [],
-    'setlogchannel': [],
-    'setmoderatorrole': [],
+    'lockall': [],
+    'editlockmsg': [],
     'setlockdownrole': [],
     'setquarantinerole': [],
     'setticketstaffrole': [],
-    'lockall': [],
-    'editlockmsg': [],
+    'setautotimeout':[]
+    'setlogchannel': [],
+    'setmoderatorrole': [],
     'unlock': [],
     'unlockall': [],
 }
@@ -112,7 +114,7 @@ def _normalize_extracted_text(text: str) -> str:
     if not text:
         return ''
     normalized = text.replace('[.]', '.').replace('(.)', '.').replace('{.}', '.')
-    # Normalize spaced separators so obfuscated links in text are still parsed.
+    # OCR often inserts spaces/newlines around separators in URLs.
     normalized = re.sub(r'\s*([.:/])\s*', r'\1', normalized)
     normalized = re.sub(r'\b(h\s*t\s*t\s*p\s*s?)\s*:\s*/\s*/', lambda m: m.group(1).replace(' ', '') + '://', normalized, flags=re.IGNORECASE)
     normalized = re.sub(r'\s+', ' ', normalized)
@@ -142,7 +144,6 @@ def _extract_urls_for_analysis(text: str):
             urls.add(candidate)
     return sorted(urls)
 
-
 def _build_phish_pattern_from_link(raw_link: str):
     normalized_link = _normalize_url_candidate(raw_link or '')
     if not normalized_link:
@@ -169,12 +170,11 @@ def _build_phish_pattern_from_link(raw_link: str):
 
     return normalized_link, pattern
 
-
 def is_phish(url: str) -> bool:
     normalized_url = _normalize_extracted_text(url or '')
     if CUSTOM_PHISH_RE is not None and CUSTOM_PHISH_RE.search(normalized_url):
         return True
-
+      
     try:
         from urllib.parse import urlparse
         parsed = urlparse(url)
@@ -192,7 +192,7 @@ def is_phish(url: str) -> bool:
         return False
     if any(host == b or host.endswith('.' + b) for b in blocklist):
         return True
-
+      
     score = 0
 
     labels = [part for part in host.split('.') if part]
@@ -206,7 +206,7 @@ def is_phish(url: str) -> bool:
         score += 1
     if second_level and re.search(r'[aeiou]', second_level) is None and len(second_level) >= 7:
         score += 1
-
+      
     if PHISH_RE.search(url):
         score += 2
     if SUSPICIOUS_HOST_TERMS.search(host):
@@ -223,7 +223,6 @@ def is_phish(url: str) -> bool:
 
 def detect_discord_token(text: str):
     return TOKEN_RE.search(text)
-
 
 class TicketOpenView(discord.ui.View):
     def __init__(self, bot):
@@ -336,7 +335,6 @@ class TicketCreateModal(discord.ui.Modal, title='Create Support Ticket'):
             str(self.ticket_description).strip(),
         )
 
-
 class TicketPanelView(discord.ui.View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -356,12 +354,10 @@ class TicketPanelView(discord.ui.View):
 
         await interaction.response.send_modal(TicketCreateModal(self.bot))
 
-
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=PREFIX, intents=discord.Intents.all(), help_command=None)
         self.case_records = []
-        self.trivia_scores = {}
         self.custom_link_patterns = []
         self.settings = {
             'guilds': {},
@@ -371,18 +367,20 @@ class Bot(commands.Bot):
                 'lockdown_role_id': LOCKDOWN_ROLE_ID,
                 'ticket_staff_role_id': TICKET_STAFF_ROLE_ID,
                 'quarantine_role_id': QUARANTINE_ROLE_ID,
+                'auto_timeout_duration_days': AUTO_TIMEOUT_DURATION_DAYS,
+                'auto_timeout_duration_days': AUTO_TIMEOUT_DURATION_DAYS,
             },
         }
         self.lockdown_state = {}
         self.ticket_panel_view = None
         self.ticket_open_view = None
         self._load_cases()
-        self._load_trivia_scores()
         self._load_custom_link_patterns()
         self._load_settings()
         self._load_lockdown_state()
         self._refresh_custom_phish_regex()
         self._register_commands()
+        
 
     async def setup_hook(self):
         # Views must be created after the event loop is running.
@@ -401,14 +399,35 @@ class Bot(commands.Bot):
         async def ping_callback(ctx):
             await self.ping(ctx)
 
+        async def setlogchannel_callback(ctx, channel: discord.TextChannel = None):
+            await self.setlogchannel(ctx, channel=channel)
+
         async def ban_callback(ctx, member: discord.Member, *, reason='No reason'):
             await self.ban(ctx, member, reason=reason)
 
         async def unban_callback(ctx, user_id: int, *, reason='No reason'):
             await self.unban(ctx, user_id, reason=reason)
 
+        async def verify_callback(ctx, member: discord.Member, *, reason='Verified by staff'):
+            await self.verify(ctx, member, reason=reason)
+
+        async def setautotimeout_callback(ctx, days: int = None):
+            await self.setautotimeout(ctx, days=days)
+
+        async def announce_callback(ctx, channel: discord.TextChannel = None, *, text: str):
+            await self.announce(ctx, channel=channel, text=text)
+
         async def kick_callback(ctx, member: discord.Member, *, reason='No reason'):
             await self.kick(ctx, member, reason=reason)
+
+        async def setlockdownrole_callback(ctx, role: discord.Role = None):
+            await self.setlockdownrole(ctx, role=role)
+
+        async def setquarantinerole_callback(ctx, role: discord.Role = None):
+            await self.setquarantinerole(ctx, role=role)
+
+        async def setticketstaffrole_callback(ctx, role: discord.Role = None):
+            await self.setticketstaffrole(ctx, role=role)
 
         async def timeout_callback(ctx, member: discord.Member, duration: str, *, reason='No reason'):
             await self.timeout(ctx, member, duration, reason=reason)
@@ -425,41 +444,14 @@ class Bot(commands.Bot):
         async def lastphish_callback(ctx):
             await self.lastphish(ctx)
           
-        async def trivia_callback(ctx):
-            await self.trivia(ctx)
-
-        async def eightball_callback(ctx, *, question: str):
-            await self.eightball(ctx, question=question)
-
-        async def coinflip_callback(ctx):
-            await self.coinflip(ctx)
-
-        async def roll_callback(ctx, sides: int = 6):
-            await self.roll(ctx, sides=sides)
-
-        async def rps_callback(ctx, choice: str):
-            await self.rps(ctx, choice=choice)
-
         async def add_link_callback(ctx, *, link: str):
             await self.add_link(ctx, link=link)
-
-        async def ticketpanel_callback(ctx):
-            await self.ticketpanel(ctx)
-
-        async def setlogchannel_callback(ctx, channel: discord.TextChannel = None):
-            await self.setlogchannel(ctx, channel=channel)
 
         async def setmoderatorrole_callback(ctx, role: discord.Role = None):
             await self.setmoderatorrole(ctx, role=role)
 
-        async def setlockdownrole_callback(ctx, role: discord.Role = None):
-            await self.setlockdownrole(ctx, role=role)
-
-        async def setquarantinerole_callback(ctx, role: discord.Role = None):
-            await self.setquarantinerole(ctx, role=role)
-
-        async def setticketstaffrole_callback(ctx, role: discord.Role = None):
-            await self.setticketstaffrole(ctx, role=role)
+        async def ticketpanel_callback(ctx):
+            await self.ticketpanel(ctx)
 
         async def lockall_callback(ctx, *, message: str = None):
             await self.lockall(ctx, message=message)
@@ -474,7 +466,6 @@ class Bot(commands.Bot):
             await self.unlockall(ctx)
           
         check_cmd = commands.Command(check_callback, name='check')
-        check_cmd.add_check(commands.is_owner().predicate)
 
         help_cmd = commands.Command(help_callback, name='help')
         ping_cmd = commands.Command(ping_callback, name='ping')
@@ -493,24 +484,31 @@ class Bot(commands.Bot):
 
         delete_cmd = commands.Command(delete_callback, name='delete', aliases=['clear'])
         delete_cmd.add_check(self._make_command_access_check('delete'))
+        
+        verify_cmd = commands.Command(verify_callback, name='verify')
+        verify_cmd.add_check(self._make_command_access_check('verify'))
+
+        setautotimeout_cmd = commands.Command(setautotimeout_callback, name='setautotimeout')
+        setautotimeout_cmd.add_check(self._make_command_access_check('setautotimeout'))
+
+        announce_cmd = commands.Command(announce_callback, name='announce')
+        announce_cmd.add_check(commands.is_owner().predicate)
 
         cases_cmd = commands.Command(cases_callback, name='cases')
         cases_cmd.add_check(self._make_command_access_check('cases'))
 
+        setlogchannel_cmd = commands.Command(setlogchannel_callback, name='setlogchannel', aliases=['logchannel'])
+        setlogchannel_cmd.add_check(self._make_command_access_check('setlogchannel'))
+
         reply_cmd = commands.Command(reply_callback, name='reply')
         reply_cmd.add_check(self._make_command_access_check('reply'))
 
-        trivia_cmd = commands.Command(trivia_callback, name='trivia')
-        eightball_cmd = commands.Command(eightball_callback, name='8ball')
-        coinflip_cmd = commands.Command(coinflip_callback, name='coinflip')
-        roll_cmd = commands.Command(roll_callback, name='roll')
-        rps_cmd = commands.Command(rps_callback, name='rps')
         add_link_cmd = commands.Command(add_link_callback, name='add_link', aliases=['addlink'])
         ticketpanel_cmd = commands.Command(ticketpanel_callback, name='ticketpanel')
         ticketpanel_cmd.add_check(self._make_command_access_check('ticketpanel'))
 
-        setlogchannel_cmd = commands.Command(setlogchannel_callback, name='setlogchannel', aliases=['logchannel'])
-        setlogchannel_cmd.add_check(self._make_command_access_check('setlogchannel'))
+        lastphish_cmd = commands.Command(lastphish_callback, name='lastphish')
+        lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
 
         setmoderatorrole_cmd = commands.Command(setmoderatorrole_callback, name='setmoderatorrole', aliases=['modrole'])
         setmoderatorrole_cmd.add_check(self._make_command_access_check('setmoderatorrole'))
@@ -536,19 +534,15 @@ class Bot(commands.Bot):
         unlockall_cmd = commands.Command(unlockall_callback, name='unlockall')
         unlockall_cmd.add_check(self._make_command_access_check('unlockall'))
 
-        lastphish_cmd = commands.Command(lastphish_callback, name='lastphish')
-        lastphish_cmd.add_check(self._make_command_access_check('lastphish'))
-
         for command in [
             check_cmd, help_cmd, ping_cmd, ban_cmd, unban_cmd, kick_cmd, timeout_cmd,
-            delete_cmd, cases_cmd, reply_cmd, lastphish_cmd, trivia_cmd, eightball_cmd,
-            coinflip_cmd, roll_cmd, rps_cmd, add_link_cmd, ticketpanel_cmd,
-            setlogchannel_cmd, setmoderatorrole_cmd, setlockdownrole_cmd,
-            setquarantinerole_cmd, setticketstaffrole_cmd,
-            lockall_cmd, editlockmsg_cmd, unlock_cmd, unlockall_cmd
+            verify_cmd, setautotimeout_cmd, delete_cmd, cases_cmd, reply_cmd, lastphish_cmd,
+            add_link_cmd, ticketpanel_cmd, setlogchannel_cmd, setmoderatorrole_cmd,
+            setlockdownrole_cmd, setquarantinerole_cmd, setticketstaffrole_cmd,
+            lockall_cmd, editlockmsg_cmd, unlock_cmd, unlockall_cmd, announce_cmd
         ]:
             self.add_command(command)
-
+          
     def _load_settings(self):
         if not os.path.exists(BOT_SETTINGS_FILE):
             return
@@ -571,7 +565,7 @@ class Bot(commands.Bot):
         defaults = data.get('defaults', {})
         if not isinstance(defaults, dict):
             defaults = {}
-
+          
         try:
             self.settings['defaults']['log_channel_id'] = int(defaults.get('log_channel_id', LOG_CHANNEL_ID) or LOG_CHANNEL_ID)
         except Exception:
@@ -596,6 +590,11 @@ class Bot(commands.Bot):
             self.settings['defaults']['quarantine_role_id'] = int(defaults.get('quarantine_role_id', QUARANTINE_ROLE_ID) or QUARANTINE_ROLE_ID)
         except Exception:
             self.settings['defaults']['quarantine_role_id'] = QUARANTINE_ROLE_ID
+
+        try:
+            self.settings['defaults']['auto_timeout_duration_days'] = int(defaults.get('auto_timeout_duration_days', AUTO_TIMEOUT_DURATION_DAYS) or AUTO_TIMEOUT_DURATION_DAYS)
+        except Exception:
+            self.settings['defaults']['auto_timeout_duration_days'] = AUTO_TIMEOUT_DURATION_DAYS
 
         # Backward compatibility for legacy flat settings
         if 'guilds' not in data:
@@ -631,7 +630,7 @@ class Bot(commands.Bot):
         value = guild_settings.get(key, self.settings.get('defaults', {}).get(key, default))
         try:
             return int(value) if value is not None else default
-        except Exception:
+        except Excepion:
             return default
 
     def _set_guild_setting(self, guild: discord.Guild, key: str, value):
@@ -655,6 +654,9 @@ class Bot(commands.Bot):
 
     def _get_quarantine_role_id(self, guild: discord.Guild = None) -> int:
         return self._get_guild_setting(guild, 'quarantine_role_id', QUARANTINE_ROLE_ID)
+
+    def _get_auto_timeout_duration_days(self, guild: discord.Guild = None) -> int:
+        return self._get_guild_setting(guild, 'auto_timeout_duration_days', AUTO_TIMEOUT_DURATION_DAYS)
 
     def _resolve_log_channel(self, guild: discord.Guild = None):
         channel_id = self._get_log_channel_id(guild)
@@ -883,20 +885,6 @@ class Bot(commands.Bot):
 
         self._add_case('ticket_created', member, member, title, {'description': description, 'channel_id': ticket_channel.id})
         await interaction.response.send_message(f'✅ Ticket created: {ticket_channel.mention}', ephemeral=True)
-
-    async def _fetch_trivia_questions(self, amount: int = 10):
-        url = f'https://opentdb.com/api.php?amount={amount}&type=multiple'
-
-        def _load():
-            with request.urlopen(url, timeout=12) as resp:
-                payload = json.loads(resp.read().decode('utf-8'))
-                return payload.get('results', [])
-
-        try:
-            return await asyncio.to_thread(_load)
-        except Exception:
-            log.exception('Failed to fetch trivia questions')
-            return []
  
     def _get_configured_role_ids(self, command_name: str):
         configured = COMMAND_ROLE_ACCESS.get(command_name, [])
@@ -922,6 +910,10 @@ class Bot(commands.Bot):
             return perms.kick_members
         if command_name == 'timeout':
             return perms.moderate_members
+        if command_name == 'verify':
+            return perms.moderate_members
+        if command_name == 'setautotimeout':
+            return perms.manage_guild
         if command_name == 'delete':
             return perms.manage_messages
         if command_name == 'reply':
@@ -960,13 +952,16 @@ class Bot(commands.Bot):
         moderator_role_id = self._get_moderator_role_id(ctx.guild)
         if moderator_role_id > 0:
             moderator_commands = {
-                'ban', 'unban', 'kick', 'timeout', 'delete', 'reply', 'cases', 'lastphish',
+                'ban', 'unban', 'kick', 'timeout', 'verify', 'delete', 'reply', 'cases', 'lastphish',
                 'ticketpanel', 'lockall', 'editlockmsg', 'unlock', 'unlockall',
                 'setlogchannel', 'setmoderatorrole', 'setlockdownrole',
-                'setquarantinerole', 'setticketstaffrole'
+                'setquarantinerole', 'setticketstaffrole', 'setautotimeout'
             }
             if command_name in moderator_commands and any(role.id == moderator_role_id for role in ctx.author.roles):
                 return True
+
+        if command_name == 'verify' and any(role.id == moderator_role_id for role in ctx.author.roles):
+            return True
 
         return self._has_fallback_permission(ctx.author, command_name)
 
@@ -987,20 +982,6 @@ class Bot(commands.Bot):
         with open('cases.json','w') as f:
             json.dump(self.case_records, f, indent=2)
           
-    def _load_trivia_scores(self):
-        if os.path.exists('trivia_scores.json'):
-            try:
-                with open('trivia_scores.json') as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    self.trivia_scores = data
-            except Exception:
-                self.trivia_scores = {}
-
-    def _save_trivia_scores(self):
-        with open('trivia_scores.json', 'w') as f:
-            json.dump(self.trivia_scores, f, indent=2)
-
     def _load_custom_link_patterns(self):
         self.custom_link_patterns = []
         if not os.path.exists(CUSTOM_LINK_PATTERNS_FILE):
@@ -1082,48 +1063,7 @@ class Bot(commands.Bot):
             asyncio.create_task(self._send_malicious_link_embed(message, links))
         except Exception:
             pass
-
-    def _update_trivia_leaderboard(self, user: discord.abc.User, correct: bool):
-        uid = str(user.id)
-        entry = self.trivia_scores.get(uid)
-        if not isinstance(entry, dict):
-            entry = {
-                'name': str(user),
-                'correct': 0,
-                'answered': 0,
-            }
-
-        entry['name'] = str(user)
-        entry['answered'] = int(entry.get('answered', 0)) + 1
-        if correct:
-            entry['correct'] = int(entry.get('correct', 0)) + 1
-        else:
-            entry['correct'] = int(entry.get('correct', 0))
-
-        self.trivia_scores[uid] = entry
-        self._save_trivia_scores()
-
-    def _format_trivia_leaderboard(self, limit: int = 5):
-        rows = []
-        for uid, data in self.trivia_scores.items():
-            if not isinstance(data, dict):
-                continue
-            correct = int(data.get('correct', 0))
-            answered = int(data.get('answered', 0))
-            name = str(data.get('name', uid))
-            accuracy = int((correct / answered) * 100) if answered > 0 else 0
-            rows.append((correct, accuracy, answered, name))
-
-        rows.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
-        top = rows[:max(1, limit)]
-        if not top:
-            return 'No trivia scores yet.'
-
-        lines = []
-        for i, (correct, accuracy, answered, name) in enumerate(top, start=1):
-            lines.append(f'{i}. {name} — {correct} correct / {answered} answered ({accuracy}%)')
-        return '\n'.join(lines)
-      
+          
     def _add_case(self, typ, user, mod, reason, extra=None):
         case={'id':len(self.case_records)+1,'type':typ,'user':str(user),'mod':str(mod),'reason':reason,'time':datetime.utcnow().isoformat()}
         if extra: case.update(extra)
@@ -1181,7 +1121,64 @@ class Bot(commands.Bot):
             pass
 
         return True
-    
+
+    def _is_suspected_spam_account(self, member: discord.Member) -> bool:
+        if not isinstance(member, discord.Member):
+            return False
+
+        created = member.created_at.replace(tzinfo=None)
+        age = datetime.utcnow() - created
+        name_text = f'{member.name} {member.display_name}'.lower()
+
+        if age <= timedelta(days=AUTO_TIMEOUT_NEW_ACCOUNT_DAYS):
+            return True
+
+        if age <= timedelta(days=30):
+            if len(re.findall(r'\d', name_text)) >= 4:
+                return True
+            if any(term in name_text for term in ('free', 'nitro', 'gift', 'boost', 'giveaway', 'discordgift', 'discordnitro')):
+                return True
+            if member.avatar is None:
+                return True
+
+        return False
+
+    async def _auto_timeout_spam_account(self, member: discord.Member) -> bool:
+        if member.guild is None:
+            return False
+
+        duration = timedelta(days=self._get_auto_timeout_duration_days(member.guild))
+        try:
+            await member.timeout(duration, reason='Auto-timeout suspected spam account')
+        except Exception:
+            log.exception('Failed to time out suspected spam account: %s', member.id)
+            return False
+
+        age = datetime.utcnow() - member.created_at.replace(tzinfo=None)
+        self._add_case(
+            'auto_timeout_spam_account',
+            member,
+            self.user,
+            'Auto-timeout suspected spam account',
+            {'created_at': member.created_at.isoformat(), 'duration_days': self._get_auto_timeout_duration_days(member.guild)}
+        )
+
+        embed = discord.Embed(
+            title='⚠️ Suspected Spam Account Timed Out',
+            color=discord.Color.orange(),
+            timestamp=datetime.utcnow()
+        )
+        embed.add_field(name='User', value=f'{member} ({member.id})', inline=False)
+        embed.add_field(name='Account Age', value=f'{age.days} day(s)', inline=False)
+        embed.add_field(name='Reason', value='Account matched suspected spam heuristics', inline=False)
+
+        try:
+            await self._send_embed_to_log_channel(embed, guild=member.guild)
+        except Exception:
+            pass
+
+        return True
+
     async def _handle_dm_ticket(self, message: discord.Message):
         try:
             await message.channel.send(
@@ -1244,17 +1241,17 @@ class Bot(commands.Bot):
             self._log_malicious_links(message, bad)
             try: await message.delete()
             except: pass
-
+              
             evidence = 'URLs:\n' + '\n'.join(bad[:10])
             await self._quarantine_user(message, 'Malicious link detected in text', evidence[:1500])
-            try:
+            try:     
                 await message.channel.send(
                     f'⚠️ Phishing removed: {" ".join(bad[:5])}',
                     delete_after=10,
                 )
             except Exception:
                 pass
-              
+
             embed = discord.Embed(
                 title='🚨 Phishing Link Caught',
                 color=discord.Color.red(),
@@ -1263,9 +1260,24 @@ class Bot(commands.Bot):
             embed.add_field(name='User', value=f'{message.author} ({message.author.id})', inline=False)
             embed.add_field(name='Detected URL(s)', value='\n'.join(bad)[:1000], inline=False)
             embed.add_field(name='Channel', value=message.channel.mention, inline=False)
-
+           
             await self._send_embed_to_log_channel(embed, guild=message.guild)
         await self.process_commands(message)
+
+    async def on_member_join(self, member: discord.Member):
+        if member.bot or member.guild is None:
+            return
+
+        if self._is_suspected_spam_account(member):
+            timed_out = await self._auto_timeout_spam_account(member)
+            if timed_out:
+                try:
+                    await member.send(
+                        '⚠️ Your account has been temporarily timed out because it matched spam account protection criteria. '
+                        'A staff member must verify you before the timeout is removed.'
+                    )
+                except Exception:
+                    pass
 
     async def on_command_error(self, ctx, error):
         if hasattr(ctx.command, 'on_error'):
@@ -1330,30 +1342,33 @@ class Bot(commands.Bot):
         )
         embed.add_field(name='DM Ticket', value='DMs are disabled for ticket intake. Use the server ticket panel button instead.', inline=False)
         embed.add_field(name=f'{PREFIX}ping', value='Quick command test (bot should reply Pong).', inline=False)
-        embed.add_field(name=f'{PREFIX}check <text/link>', value='Owner-only manual check for suspicious links.', inline=False)
+        embed.add_field(name=f'{PREFIX}check <text/link>', value='Check a link or text for suspicious/unsafe content.', inline=False)
+        embed.add_field(name=f'{PREFIX}add_link <link>', value='Add a phishing link pattern for auto-detection.', inline=False)
         embed.add_field(name=f'{PREFIX}ban <member> [reason]', value='Ban a member.', inline=False)
         embed.add_field(name=f'{PREFIX}unban <user_id> [reason]', value='Unban a user by their ID.', inline=False)
         embed.add_field(name=f'{PREFIX}kick <member> [reason]', value='Kick a member.', inline=False)
         embed.add_field(name=f'{PREFIX}timeout <member> <duration> [reason]', value='Timeout format: 1d / 2h / 30m / 60s.', inline=False)
         embed.add_field(name=f'{PREFIX}clear [amount]', value='Delete 1-100 messages. Alias: delete.', inline=False)
-        embed.add_field(name=f'{PREFIX}add_link <link>', value='Add a phishing link pattern that everyone can report for future auto-detection.', inline=False)
+        embed.add_field(name=f'{PREFIX}verify <member> [reason]', value='Remove a timeout from a verified member.', inline=False)
         embed.add_field(name=f'{PREFIX}reply <user_id> <message>', value='Reply to a user who opened a DM ticket.', inline=False)
         embed.add_field(name=f'{PREFIX}cases [member]', value='Show stored moderation cases.', inline=False)
-        embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
-        embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
-        embed.add_field(name=f'{PREFIX}ticketpanel', value='Post the ticket panel with a Create Ticket button (staff only).', inline=False)
-        embed.add_field(name=f'{PREFIX}setlogchannel [#channel]', value='Set the channel used for embed logs (cases and phishing/security events).', inline=False)
-        embed.add_field(name=f'{PREFIX}setmoderatorrole [@role]', value='Set a moderator role that can use most moderation commands. Leave empty to clear.', inline=False)
         embed.add_field(name=f'{PREFIX}setlockdownrole [@role]', value='Set the role that lockdown commands will allow access to. Leave empty to clear.', inline=False)
         embed.add_field(name=f'{PREFIX}setquarantinerole [@role]', value='Set the role used for auto-quarantine assignments. Leave empty to clear.', inline=False)
         embed.add_field(name=f'{PREFIX}setticketstaffrole [@role]', value='Set the ticket staff role used for ticket panel access. Leave empty to clear.', inline=False)
+        embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
+        embed.add_field(name=f'{PREFIX}setlogchannel [#channel]', value='Set the channel used for embed logs (cases and phishing/security events).', inline=False)
+        embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
+        embed.add_field(name=f'{PREFIX}setmoderatorrole [@role]', value='Set a moderator role that can use most moderation commands. Leave empty to clear.', inline=False)
+        embed.add_field(name=f'{PREFIX}ticketpanel', value='Post the ticket panel with a Create Ticket button (staff only).', inline=False)
+        embed.add_field(name=f'{PREFIX}setautotimeout [days]', value='Set the auto-timeout duration for suspected spam accounts. Leave empty to clear guild override.', inline=False)
+        embed.add_field(name=f'{PREFIX}announce [#channel] <message>', value='Owner-only announcement command.', inline=False)
         embed.add_field(name=f'{PREFIX}lockall [message]', value='Lock all channels to lockdown role and create/update a temporary status channel.', inline=False)
         embed.add_field(name=f'{PREFIX}editlockmsg <message>', value='Edit the lockdown status message in the temporary channel.', inline=False)
         embed.add_field(name=f'{PREFIX}unlock [channel_id]', value='Unlock one channel (defaults to current channel).', inline=False)
         embed.add_field(name=f'{PREFIX}unlockall', value='Unlock all locked channels and delete the temporary status channel.', inline=False)
         embed.add_field(name='Ticket Buttons', value='Staff can use Open Ticket and Close Ticket buttons inside each ticket channel.', inline=False)
         await ctx.send(embed=embed)
-
+      
     async def setlogchannel(self, ctx, channel: discord.TextChannel = None):
         guild = ctx.guild
         if guild is None:
@@ -1402,6 +1417,43 @@ class Bot(commands.Bot):
             self._set_guild_setting(guild, 'quarantine_role_id', role.id)
             await ctx.send(f'✅ Quarantine role set to {role.mention}. Auto-quarantine will use this role.')
 
+    async def setautotimeout(self, ctx, days: int = None):
+        guild = ctx.guild
+        if guild is None:
+            return await ctx.send('⚠️ This command can only be used in a server.')
+
+        if days is None:
+            self._set_guild_setting(guild, 'auto_timeout_duration_days', AUTO_TIMEOUT_DURATION_DAYS)
+            await ctx.send(f'✅ Auto-timeout duration cleared. Using default: {AUTO_TIMEOUT_DURATION_DAYS} days.')
+            return
+
+        if days < 1 or days > 90:
+            return await ctx.send('⚠️ Provide a duration between 1 and 90 days.')
+
+        self._set_guild_setting(guild, 'auto_timeout_duration_days', days)
+        await ctx.send(f'✅ Auto-timeout duration set to {days} day(s) for suspected spam accounts.')
+
+    async def announce(self, ctx, channel: discord.TextChannel = None, *, text: str):
+        if channel is None:
+            channel = ctx.channel
+        if channel is None or not isinstance(channel, discord.TextChannel):
+            return await ctx.send('⚠️ Please provide a valid text channel or use this command in a text channel.')
+
+        announce_embed = discord.Embed(
+            title='📢 Announcement',
+            description=text,
+            color=discord.Color.blurple(),
+            timestamp=datetime.utcnow()
+        )
+        announce_embed.set_footer(text=f'Announcement by {ctx.author}')
+
+        try:
+            await channel.send(embed=announce_embed)
+        except Exception:
+            return await ctx.send('⚠️ Failed to send announcement to that channel.')
+
+        await ctx.send(f'✅ Announcement sent to {channel.mention}.')
+
     async def setticketstaffrole(self, ctx, role: discord.Role = None):
         guild = ctx.guild
         if guild is None:
@@ -1413,7 +1465,7 @@ class Bot(commands.Bot):
         else:
             self._set_guild_setting(guild, 'ticket_staff_role_id', role.id)
             await ctx.send(f'✅ Ticket staff role set to {role.mention}. Tickets will grant this role access.')
-
+    
     async def lockall(self, ctx, *, message: str = None):
         guild = ctx.guild
         if guild is None:
@@ -1428,7 +1480,7 @@ class Bot(commands.Bot):
             return await ctx.send(f'⚠️ Lockdown role not found: {lock_role_id}')
 
         info_text = (message or '').strip() or '🔒 This server is temporarily locked down. Please wait while staff resolve an ongoing issue.'
-
+        
         guild_state = self._get_lockdown_state(guild)
         temp_channel = None
         temp_channel_id = guild_state.get('temp_channel_id')
@@ -1709,6 +1761,18 @@ class Bot(commands.Bot):
         self._add_case('timeout', member, ctx.author, reason, {'duration':duration})
         await ctx.send(f'✅ {member} timed out for {duration}')
 
+    async def verify(self, ctx, member: discord.Member, *, reason='Verified by staff'):
+        try:
+            await member.timeout(None, reason=reason)
+        except discord.Forbidden:
+            return await ctx.send('⚠️ I do not have permission to remove the timeout for that member.')
+        except Exception:
+            log.exception('Failed to remove timeout for verified member')
+            return await ctx.send('⚠️ Failed to remove the timeout for that member.')
+
+        self._add_case('verify', member, ctx.author, reason)
+        await ctx.send(f'✅ {member.mention} has been verified and timeout removed.')
+
     async def delete(self, ctx, amount: int = 5):
         amt = max(1, min(100, amount))
         await ctx.channel.purge(limit=amt)
@@ -1815,107 +1879,7 @@ class Bot(commands.Bot):
         embed.add_field(name='Link(s)', value=links_text[:1000], inline=False)
         embed.add_field(name='Message', value=str(entry.get('content', '(no content)'))[:1000], inline=False)
         await ctx.send(embed=embed)
-    
-    async def trivia(self, ctx):
-        questions = await self._fetch_trivia_questions(10)
-        if not questions:
-            return await ctx.send('⚠️ Trivia service is unavailable right now. Try again in a moment.')
-
-        await ctx.send('🎮 Trivia game started! Reply with `A`, `B`, `C`, or `D` for each question. You have 20 seconds per question.')
-
-        score = 0
-        total = min(10, len(questions))
-        labels = ['A', 'B', 'C', 'D']
-
-        for index, q in enumerate(questions[:total], start=1):
-            correct = html.unescape(q.get('correct_answer', ''))
-            incorrect = [html.unescape(x) for x in q.get('incorrect_answers', [])]
-            options = incorrect + [correct]
-            random.shuffle(options)
-            correct_index = options.index(correct)
-
-            embed = discord.Embed(
-                title=f'🧠 Trivia {index}/{total}',
-                description=html.unescape(q.get('question', 'No question text provided.')),
-                color=discord.Color.gold(),
-                timestamp=datetime.utcnow()
-            )
-            for i, opt in enumerate(options):
-                embed.add_field(name=labels[i], value=opt[:1024], inline=False)
-
-            await ctx.send(embed=embed)
-
-            def answer_check(msg: discord.Message):
-                if msg.author != ctx.author or msg.channel != ctx.channel:
-                    return False
-                answer = msg.content.strip().upper()
-                return answer in labels
-
-            try:
-                reply = await self.wait_for('message', timeout=20.0, check=answer_check)
-                guess = reply.content.strip().upper()
-            except asyncio.TimeoutError:
-                await ctx.send(f'⏱️ Time is up! Correct answer: **{labels[correct_index]}** - {correct}')
-                self._update_trivia_leaderboard(ctx.author, correct=False)
-                lb = self._format_trivia_leaderboard(limit=5)
-                await ctx.send(f'📊 Trivia Leaderboard (Top 5):\n{lb}')
-                continue
-
-            guess_index = labels.index(guess)
-            if guess_index == correct_index:
-                score += 1
-                await ctx.send('✅ Correct!')
-                self._update_trivia_leaderboard(ctx.author, correct=True)
-            else:
-                await ctx.send(f'❌ Incorrect. Correct answer: **{labels[correct_index]}** - {correct}')
-                self._update_trivia_leaderboard(ctx.author, correct=False)
-
-            lb = self._format_trivia_leaderboard(limit=5)
-            await ctx.send(f'📊 Trivia Leaderboard (Top 5):\n{lb}')
-
-        await ctx.send(f'🏁 Game over, {ctx.author.mention}! Final score: **{score}/{total}**')
-
-    async def eightball(self, ctx, *, question: str):
-        responses = [
-            'It is certain.', 'Without a doubt.', 'You may rely on it.',
-            'Yes definitely.', 'Signs point to yes.', 'Reply hazy, try again.',
-            'Ask again later.', 'Cannot predict now.', 'Don’t count on it.',
-            'My reply is no.', 'Very doubtful.'
-        ]
-        answer = random.choice(responses)
-        embed = discord.Embed(title='🎱 Magic 8-Ball', color=discord.Color.purple(), timestamp=datetime.utcnow())
-        embed.add_field(name='Question', value=question[:1024], inline=False)
-        embed.add_field(name='Answer', value=answer, inline=False)
-        await ctx.send(embed=embed)
-
-    async def coinflip(self, ctx):
-        result = random.choice(['Heads', 'Tails'])
-        await ctx.send(f'🪙 {ctx.author.mention} flipped: **{result}**')
-
-    async def roll(self, ctx, sides: int = 6):
-        if sides < 2 or sides > 1000:
-            return await ctx.send('⚠️ Pick a number of sides between 2 and 1000.')
-        result = random.randint(1, sides)
-        await ctx.send(f'🎲 {ctx.author.mention} rolled a **{result}** (1-{sides})')
-
-    async def rps(self, ctx, *, choice: str):
-        user_choice = choice.strip().lower()
-        valid = ['rock', 'paper', 'scissors']
-        if user_choice not in valid:
-            return await ctx.send('⚠️ Use: rock, paper, or scissors.')
-
-        bot_choice = random.choice(valid)
-        if user_choice == bot_choice:
-            result = 'It\'s a tie!'
-        elif (user_choice == 'rock' and bot_choice == 'scissors') or \
-             (user_choice == 'paper' and bot_choice == 'rock') or \
-             (user_choice == 'scissors' and bot_choice == 'paper'):
-            result = 'You win!'
-        else:
-            result = 'I win!'
-
-        await ctx.send(f'✊✋✌️ You: **{user_choice}** | Me: **{bot_choice}** — {result}')
-  
+      
     @staticmethod
     def _parse_duration(s):
         s=s.lower().strip()
