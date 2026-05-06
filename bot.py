@@ -38,7 +38,7 @@ COMMAND_ROLE_ACCESS = {
     'delete': [],
     'reply': [],
     'cases': [],
-    'verify': []
+    'verify': [],
     'lastphish': [],
     'ticketpanel': [],
     'lockall': [],
@@ -46,7 +46,7 @@ COMMAND_ROLE_ACCESS = {
     'setlockdownrole': [],
     'setquarantinerole': [],
     'setticketstaffrole': [],
-    'setautotimeout':[]
+    'setautotimeout': [],
     'setlogchannel': [],
     'setmoderatorrole': [],
     'unlock': [],
@@ -1355,7 +1355,6 @@ class Bot(commands.Bot):
         embed.add_field(name=f'{PREFIX}setlockdownrole [@role]', value='Set the role that lockdown commands will allow access to. Leave empty to clear.', inline=False)
         embed.add_field(name=f'{PREFIX}setquarantinerole [@role]', value='Set the role used for auto-quarantine assignments. Leave empty to clear.', inline=False)
         embed.add_field(name=f'{PREFIX}setticketstaffrole [@role]', value='Set the ticket staff role used for ticket panel access. Leave empty to clear.', inline=False)
-        embed.add_field(name='Fun Commands', value=f'{PREFIX}trivia | {PREFIX}8ball <question> | {PREFIX}coinflip | {PREFIX}roll [sides] | {PREFIX}rps <rock/paper/scissors>', inline=False)
         embed.add_field(name=f'{PREFIX}setlogchannel [#channel]', value='Set the channel used for embed logs (cases and phishing/security events).', inline=False)
         embed.add_field(name=f'{PREFIX}lastphish', value='Show the most recent malicious-link log entry.', inline=False)
         embed.add_field(name=f'{PREFIX}setmoderatorrole [@role]', value='Set a moderator role that can use most moderation commands. Leave empty to clear.', inline=False)
@@ -1366,7 +1365,6 @@ class Bot(commands.Bot):
         embed.add_field(name=f'{PREFIX}editlockmsg <message>', value='Edit the lockdown status message in the temporary channel.', inline=False)
         embed.add_field(name=f'{PREFIX}unlock [channel_id]', value='Unlock one channel (defaults to current channel).', inline=False)
         embed.add_field(name=f'{PREFIX}unlockall', value='Unlock all locked channels and delete the temporary status channel.', inline=False)
-        embed.add_field(name='Ticket Buttons', value='Staff can use Open Ticket and Close Ticket buttons inside each ticket channel.', inline=False)
         await ctx.send(embed=embed)
       
     async def setlogchannel(self, ctx, channel: discord.TextChannel = None):
