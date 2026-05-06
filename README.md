@@ -41,9 +41,6 @@ Anti-Phish Discord Bot helps protect and manage a Discord server by combining au
 - Link and token safety checks focus on message text content.
 
 ## Setup and configuration
-1. Set your bot token and optional prefix before running the bot:
-   - `BOT_TOKEN` — your Discord bot token
-   - `BOT_PREFIX` — optional command prefix, default is `=`
 2. Invite the bot to your server with permissions for:
    - Manage roles, manage channels, moderate members, manage messages
    - Send messages, read message history, embed links
